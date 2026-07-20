@@ -1,0 +1,44 @@
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Rust build and coverage output
+target/
+**/target/
+*.profraw
+*.profdata
+lcov.info
+coverage/
+
+# Lean build output
+.lake/
+**/.lake/
+lake-packages/
+**/lake-packages/
+
+# Formal-method and conformance tool output
+formal/**/output/
+formal/**/reports/
+conformance-results/
+test-results/
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+*.tmp
+*.bak

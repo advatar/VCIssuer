@@ -1,0 +1,197 @@
+# EUDI Formal Issuer normative manifest seed.
+# A production build MUST fail while `production_ready = false`, while an
+# applicable digest is blank, or while a source points only to a mutable branch.
+
+manifest_version = 1
+profile_bundle = "eudi-fi-baseline-2026-07"
+created_on = "2026-07-20"
+production_ready = false
+
+[policy]
+require_content_sha256 = true
+forbid_floating_latest = true
+forbid_unresolved_conflicts = true
+fail_on_unknown_requirement = true
+
+[[source]]
+id = "arf"
+title = "European Digital Identity Wallet Architecture and Reference Framework"
+issuer = "European Commission / EUDI Wallet"
+version = "2.9.0"
+published = "2026-05-11"
+kind = "ecosystem-profile-informative"
+url = "https://eudi.dev/2.9.0/"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+notes = "ARF is informative; binding law and implementing acts require a separate legal register."
+
+[[source]]
+id = "arf-annex2-hlr-csv"
+title = "ARF Annex 2 authoritative High-Level Requirements CSV"
+issuer = "European Commission / EUDI Wallet"
+version = "2.9.0 snapshot"
+kind = "ecosystem-requirements"
+url = "REPLACE_WITH_IMMUTABLE_TAG_OR_COMMIT_RAW_URL"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+notes = "Vendor the exact CSV. The generated Markdown is not the authoritative source when it differs."
+
+[[source]]
+id = "oid4vci"
+title = "OpenID for Verifiable Credential Issuance 1.0"
+issuer = "OpenID Foundation"
+version = "1.0 Final"
+published = "2025-09-16"
+kind = "protocol-normative"
+url = "https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+
+[[source]]
+id = "haip"
+title = "OpenID4VC High Assurance Interoperability Profile"
+issuer = "OpenID Foundation"
+version = "1.0 Final"
+published = "2025-12-24"
+kind = "protocol-profile-normative"
+url = "https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0-final.html"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+
+[[source]]
+id = "ec-ts03"
+title = "Specification of Wallet Unit Attestations used in issuance of PID and Attestations"
+issuer = "European Commission"
+version = "1.5.2"
+published = "2026-05"
+kind = "ecosystem-technical-specification"
+url = "https://github.com/eu-digital-identity-wallet/eudi-doc-standards-and-technical-specifications/issues/17"
+artifact_url = "REPLACE_WITH_IMMUTABLE_PUBLISHED_ARTIFACT_URL"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+notes = "Complete and approve a delta analysis against ARF 2.9.0."
+
+[[source]]
+id = "attestation-rulebook"
+title = "Applicable EUDI PID or Attestation Rulebook"
+issuer = "EUDI scheme / rulebook authority"
+version = "SELECT_EXACT_VERSION"
+kind = "credential-rulebook"
+url = "SELECT_IMMUTABLE_COMMIT_URL"
+content_sha256 = ""
+applicability = ["SELECTED_CREDENTIAL_PROFILE"]
+notes = "A generic issuer profile is forbidden. Select a concrete rulebook."
+
+[[source]]
+id = "sd-jwt-vc"
+title = "SD-JWT-based Verifiable Credentials"
+issuer = "IETF"
+version = "draft-ietf-oauth-sd-jwt-vc-13"
+kind = "credential-format-normative"
+url = "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-sd-jwt-vc-13"
+content_sha256 = ""
+applicability = ["sd_jwt_vc_haip_1"]
+notes = "Pinned by HAIP 1.0; do not silently substitute a newer draft."
+
+[[source]]
+id = "token-status-list"
+title = "Token Status List"
+issuer = "IETF"
+version = "draft-ietf-oauth-status-list-14"
+kind = "status-format-normative"
+url = "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-status-list-14"
+content_sha256 = ""
+applicability = ["sd_jwt_vc_haip_1"]
+notes = "Pinned by HAIP 1.0."
+
+[[source]]
+id = "iso-18013-5"
+title = "ISO/IEC 18013-5"
+issuer = "ISO/IEC"
+version = "2021 edition or exact scheme-selected edition"
+kind = "credential-format-normative"
+url = "RECORD_LICENSED_COPY_AND_CATALOG_REFERENCE"
+content_sha256 = ""
+applicability = ["mdoc_iso_18013_5"]
+
+[[source]]
+id = "etsi-119-472-3"
+title = "ETSI TS 119 472-3"
+issuer = "ETSI"
+version = "SELECT_EXACT_PUBLISHED_VERSION"
+kind = "ecosystem-technical-specification"
+url = "REPLACE_WITH_EXACT_ETSI_DELIVERABLE"
+content_sha256 = ""
+applicability = ["profiles_using_eudi_issuance_policy"]
+
+[[source]]
+id = "etsi-119-412-6"
+title = "ETSI TS 119 412-6"
+issuer = "ETSI"
+version = "SELECT_EXACT_PUBLISHED_VERSION"
+kind = "certificate-profile"
+url = "REPLACE_WITH_EXACT_ETSI_DELIVERABLE"
+content_sha256 = ""
+applicability = ["profiles_using_eudi_access_certificates"]
+
+[[source]]
+id = "eudi-crypto-profile"
+title = "EUDI/ENISA cryptographic mechanisms profile"
+issuer = "European Commission / ENISA"
+version = "SELECT_EXACT_CURRENT_SCHEME_VERSION"
+kind = "algorithm-policy"
+url = "REPLACE_WITH_IMMUTABLE_SOURCE"
+content_sha256 = ""
+applicability = ["all-eudi-issuer-profiles"]
+
+[[tool]]
+id = "lean"
+version = "PIN_EXACT_VERSION"
+source = "PIN_ELAN_TOOLCHAIN_AND_DEPENDENCY_LOCK"
+content_sha256 = ""
+
+[[tool]]
+id = "tamarin"
+version = "PIN_EXACT_VERSION"
+source = "PIN_BINARY_OR_REPRODUCIBLE_SOURCE_COMMIT"
+content_sha256 = ""
+
+[[tool]]
+id = "aeneas-or-hax"
+version = "SELECT_ONE_PRIMARY_PIPELINE_AND_PIN_COMMIT"
+source = ""
+content_sha256 = ""
+
+[[tool]]
+id = "rust"
+version = "PIN_EXACT_RUST_TOOLCHAIN"
+source = "rust-toolchain.toml"
+content_sha256 = ""
+
+[[compatibility_profile]]
+id = "sd_jwt_vc_haip_1"
+oid4vci = "1.0 Final"
+haip = "1.0 Final"
+arf = "2.9.0"
+ts03 = "1.5.2"
+credential_format = "draft-ietf-oauth-sd-jwt-vc-13"
+status_format = "draft-ietf-oauth-status-list-14"
+rulebook = "SELECT"
+advertised = false
+
+[[compatibility_profile]]
+id = "mdoc_iso_18013_5"
+oid4vci = "1.0 Final"
+haip = "1.0 Final"
+arf = "2.9.0"
+ts03 = "1.5.2"
+credential_format = "SELECT_EXACT_ISO_EDITION"
+status_format = "SELECT"
+rulebook = "SELECT"
+advertised = false
+
+[[conflict]]
+id = "VERSION-DRIFT-001"
+status = "OPEN"
+summary = "OID4VCI, HAIP, ARF references, current IETF drafts, TS03, and rulebook revisions do not necessarily pin identical component versions."
+resolution_required = "Define and test immutable compatibility profiles; never float to current drafts."
