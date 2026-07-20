@@ -21,9 +21,9 @@ signed issuer metadata, PAR, PKCE S256, one-shot authorization codes, DPoP
 ES256 verification and replay detection, credential nonces, JWT credential
 proof verification, the pure `authorize_sign` gateway, and Keychain-backed
 SD-JWT VC signing for the German PID and learning-attestation development
-profiles. The mdoc profiles are not advertised and their credential requests
-fail closed until the CBOR/COSE encoder and its verification evidence are
-connected.
+profiles. The mdoc profiles use tagged issuer-signed items, namespace digests,
+holder COSE key binding, an MSO, and a COSE Sign1 carrying a Keychain-bound
+development document-signer certificate chain.
 
 This bundle is a concrete starting specification for a Rust Credential Issuer that issues PID or electronic attestations into certified EUDI Wallet Units.
 

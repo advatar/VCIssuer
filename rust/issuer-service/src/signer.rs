@@ -6,6 +6,10 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::ecdsa::Signature;
+use rcgen::{
+    CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, RemoteKeyPair, SerialNumber,
+    SignatureAlgorithm,
+};
 use security_framework::{
     item::{ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult},
     key::{Algorithm, GenerateKeyOptions, KeyType, SecKey},
@@ -24,6 +28,8 @@ pub enum SignerError {
     InvalidPublicKey { length: usize, prefix: u8 },
     #[error("Keychain returned an invalid ECDSA signature")]
     InvalidSignature,
+    #[error("development certificate generation failed: {0}")]
+    Certificate(String),
 }
 
 pub struct KeychainSigner {
@@ -31,6 +37,7 @@ pub struct KeychainSigner {
     kid: String,
     x: String,
     y: String,
+    public_key: Vec<u8>,
 }
 
 impl KeychainSigner {
@@ -75,7 +82,13 @@ impl KeychainSigner {
         let y = URL_SAFE_NO_PAD.encode(&encoded[33..65]);
         let canonical = format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{x}\",\"y\":\"{y}\"}}");
         let kid = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
-        Ok(Self { key, kid, x, y })
+        Ok(Self {
+            key,
+            kid,
+            x,
+            y,
+            public_key: encoded,
+        })
     }
 
     pub fn kid(&self) -> &str {
@@ -95,12 +108,60 @@ impl KeychainSigner {
     }
 
     pub fn sign_es256(&self, message: &[u8]) -> Result<[u8; 64], SignerError> {
-        let der = self
-            .key
-            .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
-            .map_err(|error| SignerError::Keychain(error.to_string()))?;
+        let der = self.sign_der(message)?;
         let signature = Signature::from_der(&der).map_err(|_| SignerError::InvalidSignature)?;
         Ok(signature.to_bytes().into())
+    }
+
+    pub fn development_certificate_der(label: &str) -> Result<Vec<u8>, SignerError> {
+        let signer = Self::find_or_create(label)?;
+        let remote = KeychainRemote {
+            public_key: signer.public_key.clone(),
+            signer,
+        };
+        let key_pair = KeyPair::from_remote(Box::new(remote))
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, format!("{label} development signer"));
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.serial_number = Some(SerialNumber::from_slice(
+            &Sha256::digest(label.as_bytes())[..16],
+        ));
+        params
+            .self_signed(&key_pair)
+            .map(|certificate| certificate.der().to_vec())
+            .map_err(|error| SignerError::Certificate(error.to_string()))
+    }
+
+    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+        self.key
+            .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
+            .map_err(|error| SignerError::Keychain(error.to_string()))
+    }
+}
+
+struct KeychainRemote {
+    signer: KeychainSigner,
+    public_key: Vec<u8>,
+}
+
+impl RemoteKeyPair for KeychainRemote {
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        self.signer
+            .sign_der(message)
+            .map_err(|_| rcgen::Error::RingUnspecified)
+    }
+
+    fn algorithm(&self) -> &'static SignatureAlgorithm {
+        &rcgen::PKCS_ECDSA_P256_SHA256
     }
 }
 

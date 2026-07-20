@@ -18,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ciborium::value::Value as CborValue;
 use issuer_core::{
     Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Evidence,
     Instant, IssuerRole, KeyThumbprint, NonceId, ProfileId, Request, RequestId, Session, SessionId,
@@ -32,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tracing::info;
 use url::Url;
@@ -310,6 +312,8 @@ fn issuer_metadata_value(state: &AppState) -> Value {
         "batch_credential_issuance": {"batch_size": 1},
         "credential_configurations_supported": {
             PID_SD_JWT: sd_jwt_profile(PID_SD_JWT, "eu.europa.ec.eudi.pid.1", "German PID (SD-JWT VC)"),
+            PID_MDOC: mdoc_profile(PID_MDOC, "eu.europa.ec.eudi.pid.1", "German PID (mdoc)"),
+            EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
             QEAA_SD_JWT: sd_jwt_profile(QEAA_SD_JWT, "urn:eu.europa.ec.eudi:learning:credential:1", "German learning QEAA (SD-JWT VC)")
         }
     })
@@ -321,6 +325,18 @@ fn sd_jwt_profile(configuration_id: &str, vct: &str, name: &str) -> Value {
         "scope": configuration_id,
         "vct": vct,
         "cryptographic_binding_methods_supported": ["jwk"],
+        "credential_signing_alg_values_supported": ["ES256"],
+        "proof_types_supported": {"jwt": {"proof_signing_alg_values_supported": ["ES256"]}},
+        "display": [{"name": name, "locale": "de-DE"}]
+    })
+}
+
+fn mdoc_profile(configuration_id: &str, doc_type: &str, name: &str) -> Value {
+    json!({
+        "format": "mso_mdoc",
+        "scope": configuration_id,
+        "doctype": doc_type,
+        "cryptographic_binding_methods_supported": ["cose_key"],
         "credential_signing_alg_values_supported": ["ES256"],
         "proof_types_supported": {"jwt": {"proof_signing_alg_values_supported": ["ES256"]}},
         "display": [{"name": name, "locale": "de-DE"}]
@@ -644,11 +660,28 @@ async fn credential(
                 "this development build requires macOS Keychain",
             ))
         }
-        PID_MDOC | EAA_MDOC => Err(oauth_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "credential_request_denied",
-            "mdoc encoding remains fail-closed until the COSE verification slice is connected",
-        )),
+        PID_MDOC | EAA_MDOC => {
+            #[cfg(target_os = "macos")]
+            {
+                let signer = state
+                    .credential_signers
+                    .get(request.credential_configuration_id.as_str())
+                    .expect("closed profile has a signer");
+                let credential = issue_mdoc(
+                    signer,
+                    &request.credential_configuration_id,
+                    &verified_proof.holder_jwk,
+                    now,
+                )?;
+                Ok(Json(json!({"credentials": [{"credential": credential}]})))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(oauth_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "credential_request_denied",
+                "this development build requires macOS Keychain",
+            ))
+        }
         _ => Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "unknown_credential_configuration",
@@ -658,7 +691,7 @@ async fn credential(
 }
 
 fn valid_scope(scope: &str) -> bool {
-    let allowed = [PID_SD_JWT, QEAA_SD_JWT];
+    let allowed = [PID_SD_JWT, PID_MDOC, EAA_MDOC, QEAA_SD_JWT];
     let mut count = 0;
     for item in scope.split_ascii_whitespace() {
         count += 1;
@@ -1049,6 +1082,264 @@ fn issue_sd_jwt(
     ))
 }
 
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
+fn issue_mdoc(
+    signer: &KeychainSigner,
+    profile: &str,
+    holder_jwk: &Value,
+    now: u64,
+) -> Result<String, (StatusCode, Json<OAuthError>)> {
+    let (doc_type, namespace, claims): (&str, &str, Vec<(&str, CborValue)>) = match profile {
+        PID_MDOC => (
+            "eu.europa.ec.eudi.pid.1",
+            "eu.europa.ec.eudi.pid.1",
+            vec![
+                ("family_name", CborValue::Text("Mustermann".into())),
+                ("given_name", CborValue::Text("Erika".into())),
+                ("birth_date", CborValue::Text("1990-01-01".into())),
+                ("age_over_18", CborValue::Bool(true)),
+                ("issuing_country", CborValue::Text("DE".into())),
+            ],
+        ),
+        EAA_MDOC => (
+            "org.iso.18013.5.1.mDL",
+            "org.iso.18013.5.1",
+            vec![
+                ("family_name", CborValue::Text("Mustermann".into())),
+                ("given_name", CborValue::Text("Erika".into())),
+                ("birth_date", CborValue::Text("1990-01-01".into())),
+                ("issuing_country", CborValue::Text("DE".into())),
+                ("document_number", CborValue::Text("DEV-MDL-0001".into())),
+            ],
+        ),
+        _ => unreachable!("only mdoc profiles call this encoder"),
+    };
+
+    let mut issuer_items = Vec::new();
+    let mut digest_entries = Vec::new();
+    for (digest_id, (element_identifier, element_value)) in claims.into_iter().enumerate() {
+        let item = CborValue::Map(vec![
+            (
+                CborValue::Text("digestID".into()),
+                cbor_uint(digest_id as u64),
+            ),
+            (
+                CborValue::Text("random".into()),
+                CborValue::Bytes(random_bytes(32)),
+            ),
+            (
+                CborValue::Text("elementIdentifier".into()),
+                CborValue::Text(element_identifier.into()),
+            ),
+            (CborValue::Text("elementValue".into()), element_value),
+        ]);
+        let item_bytes = cbor_encode(&item)?;
+        let tagged_item = CborValue::Tag(24, Box::new(CborValue::Bytes(item_bytes)));
+        let tagged_bytes = cbor_encode(&tagged_item)?;
+        digest_entries.push((
+            cbor_uint(digest_id as u64),
+            CborValue::Bytes(Sha256::digest(&tagged_bytes).to_vec()),
+        ));
+        issuer_items.push(tagged_item);
+    }
+
+    let holder_x = decode_jwk_coordinate(holder_jwk, "x")?;
+    let holder_y = decode_jwk_coordinate(holder_jwk, "y")?;
+    let device_key = CborValue::Map(vec![
+        (cbor_int(1), cbor_int(2)),
+        (cbor_int(-1), cbor_int(1)),
+        (cbor_int(-2), CborValue::Bytes(holder_x)),
+        (cbor_int(-3), CborValue::Bytes(holder_y)),
+    ]);
+    let signed_at = rfc3339(now)?;
+    let valid_until = rfc3339(now.saturating_add(3600))?;
+    let mso = CborValue::Map(vec![
+        (
+            CborValue::Text("version".into()),
+            CborValue::Text("1.0".into()),
+        ),
+        (
+            CborValue::Text("digestAlgorithm".into()),
+            CborValue::Text("SHA-256".into()),
+        ),
+        (
+            CborValue::Text("valueDigests".into()),
+            CborValue::Map(vec![(
+                CborValue::Text(namespace.into()),
+                CborValue::Map(digest_entries),
+            )]),
+        ),
+        (
+            CborValue::Text("deviceKeyInfo".into()),
+            CborValue::Map(vec![(CborValue::Text("deviceKey".into()), device_key)]),
+        ),
+        (
+            CborValue::Text("docType".into()),
+            CborValue::Text(doc_type.into()),
+        ),
+        (
+            CborValue::Text("validityInfo".into()),
+            CborValue::Map(vec![
+                (CborValue::Text("signed".into()), cbor_datetime(&signed_at)),
+                (
+                    CborValue::Text("validFrom".into()),
+                    cbor_datetime(&signed_at),
+                ),
+                (
+                    CborValue::Text("validUntil".into()),
+                    cbor_datetime(&valid_until),
+                ),
+            ]),
+        ),
+    ]);
+    let mso_payload = cbor_encode(&CborValue::Tag(
+        24,
+        Box::new(CborValue::Bytes(cbor_encode(&mso)?)),
+    ))?;
+    let protected = cbor_encode(&CborValue::Map(vec![
+        (cbor_int(1), cbor_int(-7)),
+        (
+            cbor_int(4),
+            CborValue::Bytes(signer.kid().as_bytes().to_vec()),
+        ),
+    ]))?;
+    let sig_structure = CborValue::Array(vec![
+        CborValue::Text("Signature1".into()),
+        CborValue::Bytes(protected.clone()),
+        CborValue::Bytes(Vec::new()),
+        CborValue::Bytes(mso_payload.clone()),
+    ]);
+    let signature = signer
+        .sign_es256(&cbor_encode(&sig_structure)?)
+        .map_err(|error| {
+            tracing::error!(%error, "mdoc signing failed");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "mdoc signing is unavailable",
+            )
+        })?;
+    let certificate_label = format!("dev.advatar.vcissuer.{}", key_label(profile));
+    let certificate =
+        KeychainSigner::development_certificate_der(&certificate_label).map_err(|error| {
+            tracing::error!(%error, "mdoc development certificate generation failed");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "mdoc issuer certificate is unavailable",
+            )
+        })?;
+    let issuer_auth = CborValue::Tag(
+        18,
+        Box::new(CborValue::Array(vec![
+            CborValue::Bytes(protected),
+            CborValue::Map(vec![(
+                cbor_int(33),
+                CborValue::Array(vec![CborValue::Bytes(certificate)]),
+            )]),
+            CborValue::Bytes(mso_payload),
+            CborValue::Bytes(signature.to_vec()),
+        ])),
+    );
+    let issuer_signed = CborValue::Map(vec![
+        (
+            CborValue::Text("nameSpaces".into()),
+            CborValue::Map(vec![(
+                CborValue::Text(namespace.into()),
+                CborValue::Array(issuer_items),
+            )]),
+        ),
+        (CborValue::Text("issuerAuth".into()), issuer_auth),
+    ]);
+    Ok(URL_SAFE_NO_PAD.encode(cbor_encode(&issuer_signed)?))
+}
+
+fn cbor_encode(value: &CborValue) -> Result<Vec<u8>, (StatusCode, Json<OAuthError>)> {
+    let mut encoded = Vec::new();
+    ciborium::ser::into_writer(value, &mut encoded).map_err(|error| {
+        tracing::error!(%error, "CBOR encoding failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "credential CBOR encoding failed",
+        )
+    })?;
+    Ok(encoded)
+}
+
+fn cbor_int(value: i64) -> CborValue {
+    CborValue::Integer(value.into())
+}
+
+fn cbor_uint(value: u64) -> CborValue {
+    CborValue::Integer(value.into())
+}
+
+fn cbor_datetime(value: &str) -> CborValue {
+    CborValue::Tag(0, Box::new(CborValue::Text(value.into())))
+}
+
+fn random_bytes(length: usize) -> Vec<u8> {
+    let mut value = vec![0_u8; length];
+    rand::rng().fill_bytes(&mut value);
+    value
+}
+
+fn decode_jwk_coordinate(
+    jwk: &Value,
+    name: &str,
+) -> Result<Vec<u8>, (StatusCode, Json<OAuthError>)> {
+    let encoded = jwk.get(name).and_then(Value::as_str).ok_or_else(|| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "holder JWK coordinate is missing",
+        )
+    })?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "holder JWK coordinate is malformed",
+        )
+    })?;
+    if decoded.len() != 32 {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "holder P-256 coordinate must be 32 octets",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn rfc3339(timestamp: u64) -> Result<String, (StatusCode, Json<OAuthError>)> {
+    let timestamp = i64::try_from(timestamp).map_err(|_| {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "credential timestamp is out of range",
+        )
+    })?;
+    let value = OffsetDateTime::from_unix_timestamp(timestamp).map_err(|error| {
+        tracing::error!(%error, "credential timestamp conversion failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "credential timestamp conversion failed",
+        )
+    })?;
+    value.format(&Rfc3339).map_err(|error| {
+        tracing::error!(%error, "credential timestamp formatting failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "credential timestamp formatting failed",
+        )
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_dpop(
     proof: &str,
@@ -1299,5 +1590,84 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and accesses a persistent macOS Keychain key"]
+    fn mdoc_encoder_produces_tagged_issuer_signed_cbor() {
+        let signer =
+            KeychainSigner::find_or_create("dev.advatar.vcissuer.test-mdoc").expect("test signer");
+        KeychainSigner::development_certificate_der("dev.advatar.vcissuer.pid-mdoc")
+            .expect("development certificate");
+        let holder = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let point = holder.verifying_key().to_encoded_point(false);
+        let holder_jwk = json!({
+            "kty":"EC",
+            "crv":"P-256",
+            "x":URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
+            "y":URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"))
+        });
+        let credential = issue_mdoc(&signer, PID_MDOC, &holder_jwk, unix_time().expect("clock"))
+            .expect("mdoc issuance");
+        let bytes = URL_SAFE_NO_PAD.decode(credential).expect("base64url mdoc");
+        let decoded: CborValue = ciborium::de::from_reader(bytes.as_slice()).expect("CBOR mdoc");
+        let CborValue::Map(entries) = decoded else {
+            panic!("IssuerSigned must be a CBOR map");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key.as_text() == Some("nameSpaces"))
+        );
+        assert!(entries.iter().any(|(key, value)| {
+            key.as_text() == Some("issuerAuth") && matches!(value, CborValue::Tag(18, _))
+        }));
+
+        let issuer_auth = entries
+            .iter()
+            .find_map(|(key, value)| (key.as_text() == Some("issuerAuth")).then_some(value))
+            .expect("issuerAuth");
+        let CborValue::Tag(18, cose) = issuer_auth else {
+            panic!("issuerAuth must be tagged COSE_Sign1");
+        };
+        let CborValue::Array(cose) = cose.as_ref() else {
+            panic!("COSE_Sign1 must be an array");
+        };
+        let protected = cose[0].as_bytes().expect("protected headers");
+        let unprotected = cose[1].as_map().expect("unprotected headers");
+        assert!(unprotected.iter().any(|(label, chain)| {
+            label
+                .as_integer()
+                .and_then(|value| i64::try_from(value).ok())
+                == Some(33)
+                && chain.as_array().is_some_and(|certificates| {
+                    certificates.len() == 1 && certificates[0].as_bytes().is_some()
+                })
+        }));
+        let payload = cose[2].as_bytes().expect("MSO payload");
+        let signature = cose[3].as_bytes().expect("COSE signature");
+        let sig_structure = CborValue::Array(vec![
+            CborValue::Text("Signature1".into()),
+            CborValue::Bytes(protected.clone()),
+            CborValue::Bytes(Vec::new()),
+            CborValue::Bytes(payload.clone()),
+        ]);
+        let jwk = signer.public_jwk();
+        let x = URL_SAFE_NO_PAD
+            .decode(jwk["x"].as_str().expect("x"))
+            .expect("x base64url");
+        let y = URL_SAFE_NO_PAD
+            .decode(jwk["y"].as_str().expect("y"))
+            .expect("y base64url");
+        let point =
+            EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
+        let verifying_key = VerifyingKey::from_encoded_point(&point).expect("issuer key");
+        verifying_key
+            .verify(
+                &cbor_encode(&sig_structure).expect("Sig_structure"),
+                &Signature::from_slice(signature).expect("raw ES256 signature"),
+            )
+            .expect("COSE signature verifies");
     }
 }
