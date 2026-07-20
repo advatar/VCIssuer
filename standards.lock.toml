@@ -146,8 +146,8 @@ applicability = ["all-eudi-issuer-profiles"]
 
 [[tool]]
 id = "lean"
-version = "PIN_EXACT_VERSION"
-source = "PIN_ELAN_TOOLCHAIN_AND_DEPENDENCY_LOCK"
+version = "4.32.0"
+source = "leanprover/lean4:v4.32.0 via elan; formal/lean/lean-toolchain"
 content_sha256 = ""
 
 [[tool]]

@@ -1,5 +1,30 @@
 # EUDI Formal Credential Issuer — specification seed v0.1
 
+## Runnable Rust development service
+
+The repository now contains an incremental Rust implementation in
+`rust/issuer-service`. On macOS it keeps separate P-256 signing keys in the
+login Keychain and performs signatures through Security.framework.
+
+Run it locally:
+
+```sh
+cd rust
+LISTEN_ADDR=127.0.0.1:18080 \
+ISSUER_URL=http://127.0.0.1:18080 \
+RUST_LOG=issuer_service=info \
+cargo run -p issuer-service
+```
+
+Implemented gates currently include issuer and authorization-server metadata,
+signed issuer metadata, PAR, PKCE S256, one-shot authorization codes, DPoP
+ES256 verification and replay detection, credential nonces, JWT credential
+proof verification, the pure `authorize_sign` gateway, and Keychain-backed
+SD-JWT VC signing for the German PID and learning-attestation development
+profiles. The mdoc profiles are not advertised and their credential requests
+fail closed until the CBOR/COSE encoder and its verification evidence are
+connected.
+
 This bundle is a concrete starting specification for a Rust Credential Issuer that issues PID or electronic attestations into certified EUDI Wallet Units.
 
 It deliberately separates four kinds of evidence:

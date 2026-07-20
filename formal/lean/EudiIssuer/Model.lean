@@ -159,6 +159,9 @@ def mayIssue (s : Session) (r : Request) (now : Instant) : Prop :=
   s.statusReserved = true ∧
   s.alreadyIssued = false
 
+noncomputable instance mayIssueDecidable (s : Session) (r : Request) (now : Instant) :
+    Decidable (mayIssue s r now) := Classical.propDecidable _
+
 inductive Error where
   | notAuthorized
   deriving DecidableEq, Repr
@@ -172,7 +175,7 @@ structure SignCommand where
   deriving DecidableEq, Repr
 
 /-- The unique pure gateway to a credential signing command. -/
-def authorizeSign (s : Session) (r : Request) (now : Instant) :
+noncomputable def authorizeSign (s : Session) (r : Request) (now : Instant) :
     Except Error SignCommand :=
   if _h : mayIssue s r now then
     .ok {
@@ -201,5 +204,43 @@ theorem disabled_profile_cannot_sign
     (hDisabled : s.profile.enabled = false) :
     authorizeSign s r now = .error .notAuthorized := by
   simp [authorizeSign, mayIssue, hDisabled]
+
+/-- A signing command exposes the replay, holder-binding, and status gates used by the runtime. -/
+theorem authorizeSign_security_gates
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (h : authorizeSign s r now = .ok cmd) :
+    s.profile.enabled = true ∧
+    r.proof.nonce = s.expectedNonce ∧
+    s.nonceUnused = true ∧
+    r.proof.holderKey = r.dpopKey ∧
+    s.statusReserved = true ∧
+    s.alreadyIssued = false := by
+  have hMay := authorizeSign_sound s r now cmd h
+  rcases hMay with
+    ⟨hEnabled, _, _, _, _, _, _, _, _, _, hProofNonce, hNonceUnused,
+      hHolderBinding, _, _, _, _, _, _, _, _, _, _, hStatus, hNotIssued⟩
+  exact ⟨hEnabled, hProofNonce, hNonceUnused, hHolderBinding, hStatus, hNotIssued⟩
+
+/-- A successful PID signing decision always carries LoA-high subject evidence. -/
+theorem pid_authorizeSign_requires_loa_high
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (hRole : s.profile.role = .pid)
+    (h : authorizeSign s r now = .ok cmd) :
+    s.subject.loaHigh = true := by
+  have hMay := authorizeSign_sound s r now cmd h
+  rcases hMay with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hRoleEvidence, _⟩
+  simp [roleEvidenceOk, hRole] at hRoleEvidence
+  exact hRoleEvidence
+
+/-- Successful issuance cannot exceed the WIA/KA maintenance period. -/
+theorem authorizeSign_respects_wallet_maintenance_bound
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (h : authorizeSign s r now = .ok cmd) :
+    r.expiry ≤ s.wiaKaMaintenanceEnd := by
+  have hMay := authorizeSign_sound s r now cmd h
+  rcases hMay with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hBound, _⟩
+  exact hBound
 
 end EudiIssuer
