@@ -1,0 +1,3 @@
+[submodule "WebIssuer"]
+	path = WebIssuer
+	url = git@github.com:advatar/just-issuer.git

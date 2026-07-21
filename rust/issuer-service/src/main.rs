@@ -12,8 +12,9 @@ use std::{
 
 use axum::{
     Json, Router,
+    extract::Path,
     extract::{Form, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::Redirect,
     routing::{get, post},
 };
@@ -35,6 +36,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use url::Url;
 use uuid::Uuid;
@@ -64,6 +66,7 @@ struct VolatileState {
     tokens: HashMap<String, AccessToken>,
     nonces: HashMap<String, bool>,
     dpop_jtis: HashSet<String>,
+    offers: HashMap<String, CredentialOffer>,
 }
 
 #[derive(Clone)]
@@ -88,6 +91,12 @@ struct AccessToken {
     dpop_jkt: String,
 }
 
+struct CredentialOffer {
+    profile: String,
+    issuer_state: String,
+    expires_at: u64,
+}
+
 #[derive(Deserialize)]
 struct ParRequest {
     client_id: String,
@@ -97,6 +106,19 @@ struct ParRequest {
     state: Option<String>,
     code_challenge: String,
     code_challenge_method: String,
+    issuer_state: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateOfferRequest {
+    credential_configuration_id: String,
+}
+
+#[derive(Serialize)]
+struct CreateOfferResponse {
+    credential_offer_uri: String,
+    deep_link: String,
+    expires_in: u64,
 }
 
 #[derive(Serialize)]
@@ -221,6 +243,22 @@ async fn main() {
 }
 
 fn app(state: AppState) -> Router {
+    let configured_origins: HashSet<String> = std::env::var("CORS_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let ui_origins = AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+        let Ok(value) = origin.to_str() else {
+            return false;
+        };
+        configured_origins.contains(value)
+            || Url::parse(value).ok().is_some_and(|url| {
+                matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            })
+    });
+
     Router::new()
         .route("/health", get(health))
         .route(
@@ -232,11 +270,19 @@ fn app(state: AppState) -> Router {
             get(oauth_metadata),
         )
         .route("/jwks.json", get(jwks))
+        .route("/credential-offers", post(create_credential_offer))
+        .route("/credential-offer/{id}", get(get_credential_offer))
         .route("/par", post(par))
         .route("/authorize", get(authorize))
         .route("/token", post(token))
         .route("/nonce", post(nonce))
         .route("/credential", post(credential))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(ui_origins)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([axum::http::header::CONTENT_TYPE]),
+        )
         .with_state(state)
 }
 
@@ -393,6 +439,33 @@ async fn par(
             "scope contains an unsupported credential",
         ));
     }
+    if let Some(issuer_state) = request.issuer_state.as_deref() {
+        let now = unix_time()?;
+        let inner = state.inner.lock().await;
+        let offer = inner
+            .offers
+            .values()
+            .find(|offer| offer.issuer_state == issuer_state)
+            .ok_or_else(|| {
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "issuer_state is unknown",
+                )
+            })?;
+        if offer.expires_at < now
+            || !request
+                .scope
+                .split_ascii_whitespace()
+                .any(|scope| scope == offer.profile)
+        {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "credential offer is expired or does not match the requested scope",
+            ));
+        }
+    }
     let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::new_v4());
     state.inner.lock().await.pushed.insert(
         request_uri.clone(),
@@ -408,6 +481,78 @@ async fn par(
         request_uri,
         expires_in: 60,
     }))
+}
+
+async fn create_credential_offer(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOfferRequest>,
+) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
+    if !valid_scope(&request.credential_configuration_id)
+        || request.credential_configuration_id.contains(' ')
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "credential configuration is unknown",
+        ));
+    }
+    let id = Uuid::new_v4().to_string();
+    let issuer_state = random_token();
+    let expires_in = 300;
+    let expires_at = unix_time()?.saturating_add(expires_in);
+    state.inner.lock().await.offers.insert(
+        id.clone(),
+        CredentialOffer {
+            profile: request.credential_configuration_id,
+            issuer_state,
+            expires_at,
+        },
+    );
+    let credential_offer_uri = state
+        .issuer
+        .join(&format!("credential-offer/{id}"))
+        .expect("opaque offer ID creates a valid URL")
+        .to_string();
+    let mut deep_link = Url::parse("openid-credential-offer://").expect("static URL is valid");
+    deep_link
+        .query_pairs_mut()
+        .append_pair("credential_offer_uri", &credential_offer_uri);
+    Ok(Json(CreateOfferResponse {
+        credential_offer_uri,
+        deep_link: deep_link.to_string(),
+        expires_in,
+    }))
+}
+
+async fn get_credential_offer(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    let now = unix_time()?;
+    let inner = state.inner.lock().await;
+    let offer = inner.offers.get(&id).ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            "credential offer is unknown",
+        )
+    })?;
+    if offer.expires_at < now {
+        return Err(oauth_error(
+            StatusCode::GONE,
+            "invalid_request",
+            "credential offer has expired",
+        ));
+    }
+    Ok(Json(json!({
+        "credential_issuer": state.issuer.as_str().trim_end_matches('/'),
+        "credential_configuration_ids": [offer.profile],
+        "grants": {
+            "authorization_code": {
+                "issuer_state": offer.issuer_state
+            }
+        }
+    })))
 }
 
 async fn authorize(
