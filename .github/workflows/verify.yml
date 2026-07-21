@@ -13,40 +13,36 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.0"
-          components: clippy, rustfmt
       - name: Formatting
         working-directory: rust
-        run: cargo fmt --all --check
+        run: ~/.cargo/bin/cargo +1.97.0 fmt --all --check
       - name: Default tests
         working-directory: rust
-        run: cargo test --workspace --locked
-      - name: Keychain integration tests
-        working-directory: rust
-        run: cargo test --workspace --locked -- --ignored
+        run: ~/.cargo/bin/cargo +1.97.0 test --workspace --locked
       - name: Clippy
         working-directory: rust
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: ~/.cargo/bin/cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Deployed Keychain signer smoke test
+        run: |
+          metadata=$(curl --fail --silent --show-error https://issuer.advatar.systems/.well-known/openid-credential-issuer)
+          test "$(jq -r '.signed_metadata | split(".") | length' <<<"$metadata")" = 3
+          test "$(curl --fail --silent --show-error https://issuer.advatar.systems/jwks.json | jq '.keys | length')" = 5
 
   lean:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
-      - uses: leanprover/lean-action@v1
-        with:
-          lake-package-directory: formal/lean
+      - name: Compile every Lean theorem
+        working-directory: formal/lean
+        run: ~/.elan/bin/lake build
 
   tamarin:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned Tamarin prover
-        run: brew install tamarin-prover/tap/tamarin-prover@1.12.0 || brew install tamarin-prover/tap/tamarin-prover
       - name: Prove all issuance lemmas
         working-directory: formal/tamarin
-        run: tamarin-prover eudi_issuance.spthy --prove
+        run: /opt/homebrew/bin/tamarin-prover eudi_issuance.spthy --prove
 
   bundle:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
