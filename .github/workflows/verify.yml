@@ -41,8 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Prove all issuance lemmas
-        working-directory: formal/tamarin
-        run: MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove
+        run: |
+          ssh -i ~/actions-runner-vcissuer/tamarin-ci-key -o BatchMode=yes johansellstrom@127.0.0.1 \
+            'cd ~/actions-runner-vcissuer/_work/VCIssuer/VCIssuer/formal/tamarin && MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove'
 
   bundle:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
