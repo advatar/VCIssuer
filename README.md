@@ -45,6 +45,13 @@ profiles. The mdoc profiles use tagged issuer-signed items, namespace digests,
 holder COSE key binding, an MSO, and a COSE Sign1 carrying a Keychain-bound
 development document-signer certificate chain.
 
+The learning-attestation development profile is available in independently identified and
+PID-bound variants. The PID-bound variant verifies a selectively disclosed PID presentation,
+matches it to the authoritative education subject, and requires a fresh PID-holder-key proof that
+binds the PID issuer JWT to the new credential holder key. It then emits
+`cryptographically_bound_to: eu.europa.ec.eudi.pid.1`. Holder/device binding remains a separate
+policy in both variants.
+
 This bundle is a concrete starting specification for a Rust Credential Issuer that issues PID or electronic attestations into certified EUDI Wallet Units.
 
 It deliberately separates four kinds of evidence:

@@ -48,6 +48,9 @@ const PID_SD_JWT: &str = "eu.europa.ec.eudi.pid_vc_sd_jwt.de";
 const PID_MDOC: &str = "eu.europa.ec.eudi.pid_mso_mdoc.de";
 const EAA_MDOC: &str = "org.iso.18013.5.1.mDL.de";
 const QEAA_SD_JWT: &str = "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt:de";
+const QEAA_PID_BOUND_SD_JWT: &str =
+    "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt:de:pid-bound";
+const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
 
 #[derive(Clone)]
 struct AppState {
@@ -66,6 +69,7 @@ struct VolatileState {
     tokens: HashMap<String, AccessToken>,
     nonces: HashMap<String, bool>,
     dpop_jtis: HashSet<String>,
+    binding_jtis: HashSet<String>,
     offers: HashMap<String, CredentialOffer>,
 }
 
@@ -146,6 +150,28 @@ struct TokenRequest {
 struct CredentialRequest {
     credential_configuration_id: String,
     proof: CredentialProofObject,
+    pid_binding: Option<PidBindingObject>,
+}
+
+#[derive(Deserialize)]
+struct PidBindingObject {
+    pid_vp: String,
+    proof_jwt: String,
+}
+
+#[derive(Deserialize)]
+struct BindingProofClaims {
+    aud: String,
+    iat: u64,
+    nonce: String,
+    jti: String,
+    pid_sd_hash: String,
+    new_holder_jkt: String,
+}
+
+struct VerifiedPidBinding {
+    subject: SubjectId,
+    jti: String,
 }
 
 #[derive(Deserialize)]
@@ -210,16 +236,22 @@ async fn main() {
         .expect("LISTEN_ADDR must be a socket address");
 
     #[cfg(target_os = "macos")]
-    let credential_signers = [PID_SD_JWT, PID_MDOC, EAA_MDOC, QEAA_SD_JWT]
-        .into_iter()
-        .map(|profile| {
-            let label = format!("dev.advatar.vcissuer.{}", key_label(profile));
-            KeychainSigner::find_or_create(&label).map_or_else(
-                |error| panic!("credential signing key {label} is unavailable: {error}"),
-                |signer| (profile, signer),
-            )
-        })
-        .collect();
+    let credential_signers = [
+        PID_SD_JWT,
+        PID_MDOC,
+        EAA_MDOC,
+        QEAA_SD_JWT,
+        QEAA_PID_BOUND_SD_JWT,
+    ]
+    .into_iter()
+    .map(|profile| {
+        let label = format!("dev.advatar.vcissuer.{}", key_label(profile));
+        KeychainSigner::find_or_create(&label).map_or_else(
+            |error| panic!("credential signing key {label} is unavailable: {error}"),
+            |signer| (profile, signer),
+        )
+    })
+    .collect();
 
     let app = app(AppState {
         issuer,
@@ -364,9 +396,32 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             PID_SD_JWT: sd_jwt_profile(PID_SD_JWT, "eu.europa.ec.eudi.pid.1", "German PID (SD-JWT VC)"),
             PID_MDOC: mdoc_profile(PID_MDOC, "eu.europa.ec.eudi.pid.1", "German PID (mdoc)"),
             EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
-            QEAA_SD_JWT: sd_jwt_profile(QEAA_SD_JWT, "urn:eu.europa.ec.eudi:learning:credential:1", "German learning QEAA (SD-JWT VC)")
+            QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
+            QEAA_PID_BOUND_SD_JWT: learning_profile(QEAA_PID_BOUND_SD_JWT, "German learning QEAA (cryptographically bound to PID)", true)
         }
     })
+}
+
+fn learning_profile(configuration_id: &str, name: &str, pid_bound: bool) -> Value {
+    let mut value = sd_jwt_profile(
+        configuration_id,
+        "urn:eu.europa.ec.eudi:learning:credential:1",
+        name,
+    );
+    value.as_object_mut().expect("profile is an object").insert(
+        "pid_binding".into(),
+        if pid_bound {
+            json!({
+                "required": true,
+                "pid_vct": PID_VCT,
+                "presentation_format": "dc+sd-jwt",
+                "binding_proof_alg_values_supported": ["ES256"]
+            })
+        } else {
+            json!({"required": false})
+        },
+    );
+    value
 }
 
 fn sd_jwt_profile(configuration_id: &str, vct: &str, name: &str) -> Value {
@@ -761,7 +816,7 @@ async fn credential(
             "development profile requires the credential proof and DPoP key to match",
         ));
     }
-    let nonce_used = inner.nonces.get_mut(&verified_proof.nonce).ok_or_else(|| {
+    let nonce_used = inner.nonces.get(&verified_proof.nonce).ok_or_else(|| {
         oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_proof",
@@ -776,17 +831,67 @@ async fn credential(
         ));
     }
     let now = unix_time()?;
+    let pid_binding = match request.credential_configuration_id.as_str() {
+        QEAA_PID_BOUND_SD_JWT => {
+            let supplied = request.pid_binding.as_ref().ok_or_else(|| {
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_proof",
+                    "the PID-bound profile requires pid_binding evidence",
+                )
+            })?;
+            #[cfg(target_os = "macos")]
+            let verified = verify_pid_binding(
+                supplied,
+                state
+                    .credential_signers
+                    .get(PID_SD_JWT)
+                    .expect("PID signer is configured")
+                    .public_jwk(),
+                &state.issuer,
+                &verified_proof.nonce,
+                &verified_proof.holder_jkt,
+                now,
+            )?;
+            #[cfg(not(target_os = "macos"))]
+            return Err(oauth_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "credential_request_denied",
+                "PID presentation verification requires the configured issuer key",
+            ));
+            if !inner.binding_jtis.insert(verified.jti.clone()) {
+                return Err(oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_proof",
+                    "PID binding proof jti has already been used",
+                ));
+            }
+            Some(verified)
+        }
+        _ if request.pid_binding.is_some() => {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "pid_binding evidence is not accepted by this credential profile",
+            ));
+        }
+        _ => None,
+    };
     authorize_kernel(
         &request.credential_configuration_id,
         &verified_proof.holder_jkt,
         &verified_proof.nonce,
+        pid_binding.as_ref().map(|binding| binding.subject),
         now,
     )?;
-    *nonce_used = true;
+    *inner
+        .nonces
+        .get_mut(&verified_proof.nonce)
+        .expect("nonce was checked above") = true;
     drop(inner);
 
     match request.credential_configuration_id.as_str() {
-        PID_SD_JWT | QEAA_SD_JWT => {
+        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => {
             #[cfg(target_os = "macos")]
             {
                 let signer = state
@@ -840,7 +945,13 @@ async fn credential(
 }
 
 fn valid_scope(scope: &str) -> bool {
-    let allowed = [PID_SD_JWT, PID_MDOC, EAA_MDOC, QEAA_SD_JWT];
+    let allowed = [
+        PID_SD_JWT,
+        PID_MDOC,
+        EAA_MDOC,
+        QEAA_SD_JWT,
+        QEAA_PID_BOUND_SD_JWT,
+    ];
     let mut count = 0;
     for item in scope.split_ascii_whitespace() {
         count += 1;
@@ -996,6 +1107,235 @@ fn verify_credential_proof(
     })
 }
 
+#[allow(clippy::too_many_lines)]
+fn verify_pid_binding(
+    binding: &PidBindingObject,
+    trusted_pid_issuer_jwk: Value,
+    issuer: &Url,
+    expected_nonce: &str,
+    expected_new_holder_jkt: &str,
+    now: u64,
+) -> Result<VerifiedPidBinding, (StatusCode, Json<OAuthError>)> {
+    if binding.pid_vp.len() > 32_768 || binding.proof_jwt.len() > 8_192 {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "PID binding evidence exceeds the accepted size",
+        ));
+    }
+    let mut parts = binding.pid_vp.split('~');
+    let issuer_jwt = parts.next().unwrap_or_default();
+    let tail: Vec<&str> = parts.filter(|part| !part.is_empty()).collect();
+    if issuer_jwt.is_empty() || tail.last().copied() != Some(binding.proof_jwt.as_str()) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "PID VP must end in the supplied cross-attestation proof JWT",
+        ));
+    }
+    let trusted_jwk: EcJwk = serde_json::from_value(trusted_pid_issuer_jwk).map_err(|_| {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "configured PID issuer key is malformed",
+        )
+    })?;
+    let (issuer_key, _, _) = verifying_key_and_jwk(&trusted_jwk, "invalid_proof")?;
+    let pid_payload = verify_jws_payload(issuer_jwt, &issuer_key, "PID credential")?;
+    if pid_payload.get("vct").and_then(Value::as_str) != Some(PID_VCT) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "presented credential is not the required PID type",
+        ));
+    }
+    if pid_payload
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(|value| value.trim_end_matches('/'))
+        != Some(issuer.as_str().trim_end_matches('/'))
+        || pid_payload
+            .get("nbf")
+            .and_then(Value::as_u64)
+            .is_none_or(|nbf| nbf > now)
+        || pid_payload
+            .get("exp")
+            .and_then(Value::as_u64)
+            .is_none_or(|exp| now >= exp)
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "presented PID issuer or validity interval is not accepted",
+        ));
+    }
+    let allowed_disclosures: HashSet<&str> = pid_payload
+        .get("_sd")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID has no selective-disclosure digests",
+            )
+        })?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let pid_holder_jwk: EcJwk =
+        serde_json::from_value(pid_payload.pointer("/cnf/jwk").cloned().ok_or_else(|| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID has no holder key",
+            )
+        })?)
+        .map_err(|_| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID holder key is malformed",
+            )
+        })?;
+    let (pid_holder_key, _, _) = verifying_key_and_jwk(&pid_holder_jwk, "invalid_proof")?;
+    let proof_payload =
+        verify_jws_payload(&binding.proof_jwt, &pid_holder_key, "PID binding proof")?;
+    let claims: BindingProofClaims = serde_json::from_value(proof_payload).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "PID binding proof claims are malformed",
+        )
+    })?;
+    if claims.aud.trim_end_matches('/') != issuer.as_str().trim_end_matches('/')
+        || claims.nonce != expected_nonce
+        || claims.new_holder_jkt != expected_new_holder_jkt
+        || claims.pid_sd_hash != URL_SAFE_NO_PAD.encode(Sha256::digest(issuer_jwt.as_bytes()))
+        || claims.jti.is_empty()
+        || claims.jti.len() > 256
+        || claims.iat > now.saturating_add(5)
+        || now.saturating_sub(claims.iat) > 300
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "PID binding proof is stale or does not bind this PID, nonce, issuer, and new holder key",
+        ));
+    }
+
+    let mut family_name = None;
+    let mut given_name = None;
+    let mut birthdate = None;
+    for encoded in tail.iter().take(tail.len().saturating_sub(1)) {
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(encoded.as_bytes()));
+        if !allowed_disclosures.contains(digest.as_str()) {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID disclosure is not committed by the issuer",
+            ));
+        }
+        let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID disclosure is malformed",
+            )
+        })?;
+        let disclosure: Value = serde_json::from_slice(&decoded).map_err(|_| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID disclosure is not JSON",
+            )
+        })?;
+        let values = disclosure.as_array().ok_or_else(|| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "PID disclosure is not an array",
+            )
+        })?;
+        if values.len() != 3 {
+            continue;
+        }
+        match values[1].as_str() {
+            Some("family_name") => family_name = values[2].as_str().map(str::to_owned),
+            Some("given_name") => given_name = values[2].as_str().map(str::to_owned),
+            Some("birthdate") => birthdate = values[2].as_str().map(str::to_owned),
+            _ => {}
+        }
+    }
+    if family_name.as_deref() != Some("Mustermann")
+        || given_name.as_deref() != Some("Erika")
+        || birthdate.as_deref() != Some("1990-01-01")
+    {
+        return Err(oauth_error(
+            StatusCode::FORBIDDEN,
+            "credential_request_denied",
+            "PID subject does not match the authoritative education record",
+        ));
+    }
+    let canonical_subject = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        family_name.expect("matched"),
+        given_name.expect("matched"),
+        birthdate.expect("matched")
+    );
+    Ok(VerifiedPidBinding {
+        subject: SubjectId(hash_u128(&canonical_subject)),
+        jti: claims.jti,
+    })
+}
+
+fn verify_jws_payload(
+    compact: &str,
+    key: &VerifyingKey,
+    label: &str,
+) -> Result<Value, (StatusCode, Json<OAuthError>)> {
+    let parts: Vec<&str> = compact.split('.').collect();
+    if parts.len() != 3 {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            format!("{label} is not a compact JWS"),
+        ));
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .ok()
+        .and_then(|raw| Signature::from_slice(&raw).ok())
+        .ok_or_else(|| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                format!("{label} signature is malformed"),
+            )
+        })?;
+    key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .map_err(|_| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                format!("{label} signature is invalid"),
+            )
+        })?;
+    let payload = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            format!("{label} payload is malformed"),
+        )
+    })?;
+    serde_json::from_slice(&payload).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            format!("{label} payload is not JSON"),
+        )
+    })
+}
+
 fn verifying_key_and_jwk(
     jwk: &EcJwk,
     error_code: &'static str,
@@ -1059,11 +1399,12 @@ fn authorize_kernel(
     profile_name: &str,
     holder_jkt: &str,
     nonce: &str,
+    pid_subject: Option<SubjectId>,
     now: u64,
 ) -> Result<(), (StatusCode, Json<OAuthError>)> {
     let role = match profile_name {
         PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
-        QEAA_SD_JWT => IssuerRole::Qeaa,
+        QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
         _ => {
             return Err(oauth_error(
@@ -1074,14 +1415,21 @@ fn authorize_kernel(
         }
     };
     let format = match profile_name {
-        PID_SD_JWT | QEAA_SD_JWT => CredentialFormat::SdJwtVc,
+        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => CredentialFormat::SdJwtVc,
         PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
     let profile_id = ProfileId(hash_u128(profile_name));
     let holder_key = KeyThumbprint(hash_u128(holder_jkt));
     let nonce_id = NonceId(hash_u128(nonce));
-    let subject = SubjectId(1);
+    if profile_name == QEAA_PID_BOUND_SD_JWT && pid_subject.is_none() {
+        return Err(oauth_error(
+            StatusCode::FORBIDDEN,
+            "credential_request_denied",
+            "PID-bound issuance has no verified PID subject",
+        ));
+    }
+    let subject = pid_subject.unwrap_or_else(|| SubjectId(hash_u128("demo-education-subject")));
     let dataset = DatasetId(hash_u128(profile_name));
     let evidence = Evidence {
         valid_from: Instant(now.saturating_sub(1)),
@@ -1095,6 +1443,7 @@ fn authorize_kernel(
         format,
         enabled: true,
         device_binding_required: true,
+        pid_binding_required: profile_name == QEAA_PID_BOUND_SD_JWT,
     };
     let proof = CredentialProof {
         evidence,
@@ -1137,6 +1486,7 @@ fn authorize_kernel(
             entitled: true,
             claims_current: true,
             dataset,
+            pid_binding_verified: pid_subject.is_some(),
         },
         expected_nonce: nonce_id,
         nonce_unused: true,
@@ -1179,7 +1529,7 @@ fn issue_sd_jwt(
                 ("issuing_country", json!("DE")),
             ],
         ),
-        QEAA_SD_JWT => (
+        QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => (
             "urn:eu.europa.ec.eudi:learning:credential:1",
             vec![
                 ("credential_name", json!("Hochschulabschluss")),
@@ -1210,6 +1560,13 @@ fn issue_sd_jwt(
         "_sd_alg": "sha-256",
         "_sd": digests
     });
+    let mut payload = payload;
+    if profile == QEAA_PID_BOUND_SD_JWT {
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("cryptographically_bound_to".into(), json!(PID_VCT));
+    }
     let header = json!({"alg":"ES256", "typ":"dc+sd-jwt", "kid":signer.kid()});
     let protected =
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header is serializable"));
@@ -1652,7 +2009,7 @@ fn verify_dpop(
 fn oauth_error(
     status: StatusCode,
     error: &'static str,
-    description: &str,
+    description: impl Into<String>,
 ) -> (StatusCode, Json<OAuthError>) {
     (
         status,
@@ -1736,6 +2093,90 @@ mod tests {
             verify_credential_proof(
                 &tampered,
                 &Url::parse("http://127.0.0.1:18080").expect("issuer URL")
+            )
+            .is_err()
+        );
+    }
+
+    fn public_jwk(key: &SigningKey) -> Value {
+        let point = key.verifying_key().to_encoded_point(false);
+        json!({
+            "kty":"EC", "crv":"P-256",
+            "x":URL_SAFE_NO_PAD.encode(point.x().expect("x")),
+            "y":URL_SAFE_NO_PAD.encode(point.y().expect("y"))
+        })
+    }
+
+    fn signed_jwt(key: &SigningKey, header: &Value, payload: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header"));
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload"));
+        let input = format!("{header}.{payload}");
+        let signature: Signature = key.sign(input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    #[test]
+    fn pid_binding_verifies_identity_and_both_key_relationships() {
+        let now = unix_time().expect("clock");
+        let issuer_url = Url::parse("http://127.0.0.1:18080").expect("issuer");
+        let issuer_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let pid_holder = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let new_holder = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let new_jwk: EcJwk = serde_json::from_value(public_jwk(&new_holder)).expect("jwk");
+        let (_, new_jkt, _) = verifying_key_and_jwk(&new_jwk, "invalid_proof").expect("jkt");
+        let disclosures: Vec<String> = [
+            json!(["a", "family_name", "Mustermann"]),
+            json!(["b", "given_name", "Erika"]),
+            json!(["c", "birthdate", "1990-01-01"]),
+        ]
+        .into_iter()
+        .map(|value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).expect("disclosure")))
+        .collect();
+        let digests: Vec<String> = disclosures
+            .iter()
+            .map(|value| URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes())))
+            .collect();
+        let pid_jwt = signed_jwt(
+            &issuer_key,
+            &json!({"alg":"ES256","typ":"dc+sd-jwt"}),
+            &json!({
+                "iss":issuer_url.as_str().trim_end_matches('/'), "vct":PID_VCT,
+                "nbf":now-1, "exp":now+300, "cnf":{"jwk":public_jwk(&pid_holder)},
+                "_sd":digests
+            }),
+        );
+        let proof = signed_jwt(
+            &pid_holder,
+            &json!({"alg":"ES256","typ":"eudi-pid-binding+jwt"}),
+            &json!({
+                "aud":issuer_url.as_str(), "iat":now, "nonce":"nonce", "jti":"binding-1",
+                "pid_sd_hash":URL_SAFE_NO_PAD.encode(Sha256::digest(pid_jwt.as_bytes())),
+                "new_holder_jkt":new_jkt
+            }),
+        );
+        let binding = PidBindingObject {
+            pid_vp: format!("{}~{}~{}", pid_jwt, disclosures.join("~"), proof),
+            proof_jwt: proof,
+        };
+        let verified = verify_pid_binding(
+            &binding,
+            public_jwk(&issuer_key),
+            &issuer_url,
+            "nonce",
+            &new_jkt,
+            now,
+        )
+        .expect("valid PID binding");
+        assert_eq!(verified.jti, "binding-1");
+
+        assert!(
+            verify_pid_binding(
+                &binding,
+                public_jwk(&issuer_key),
+                &issuer_url,
+                "nonce",
+                "other-key",
+                now,
             )
             .is_err()
         );

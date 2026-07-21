@@ -44,6 +44,7 @@ pub struct CredentialProfile {
     pub format: CredentialFormat,
     pub enabled: bool,
     pub device_binding_required: bool,
+    pub pid_binding_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +103,7 @@ pub struct SubjectEvidence {
     pub entitled: bool,
     pub claims_current: bool,
     pub dataset: DatasetId,
+    pub pid_binding_verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +192,7 @@ pub const fn may_issue(session: Session, request: Request, now: Instant) -> bool
         && session.subject.dataset.0 == request.dataset.0
         && session.subject.entitled
         && session.subject.claims_current
+        && (!session.profile.pid_binding_required || session.subject.pid_binding_verified)
         && role_evidence_ok(session.profile.role, session.subject)
         && request.expiry.0 <= session.wia_ka_maintenance_end.0
         && session.status_reserved
@@ -237,6 +240,7 @@ mod tests {
             format: CredentialFormat::SdJwtVc,
             enabled: true,
             device_binding_required: true,
+            pid_binding_required: false,
         };
         let proof = CredentialProof {
             evidence: valid_evidence(),
@@ -279,6 +283,7 @@ mod tests {
                 entitled: true,
                 claims_current: true,
                 dataset: DatasetId(5),
+                pid_binding_verified: false,
             },
             expected_nonce: NonceId(9),
             nonce_unused: true,
@@ -314,6 +319,18 @@ mod tests {
             authorize_sign(session, request, NOW),
             Err(DecisionError::NotAuthorized)
         );
+    }
+
+    #[test]
+    fn pid_bound_profile_requires_verified_cross_attestation_evidence() {
+        let (mut session, request) = fixture();
+        session.profile.pid_binding_required = true;
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+        session.subject.pid_binding_verified = true;
+        assert!(authorize_sign(session, request, NOW).is_ok());
     }
 
     #[test]

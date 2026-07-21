@@ -502,6 +502,16 @@ For PID issuance, the identity-proofing result SHALL meet LoA High requirements.
 
 ### 8.8 Credential construction
 
+An attestation profile SHALL state independently whether holder/device binding is required and
+whether cryptographic binding to an existing PID or attestation is required. For a PID-bound
+profile the issuer SHALL verify a fresh presentation of the existing PID, match its subject to the
+authoritative subject of the new attestation, and verify a proof by the existing PID holder key
+covering the PID issuer-signed JWT, issuer audience and nonce, and the new holder key. A missing,
+stale, replayed, mismatched, or uncommitted disclosure SHALL fail closed. If the applicable
+Rulebook uses it, the issued attestation SHALL carry `cryptographically_bound_to` with the exact
+PID attestation type. A profile without cross-attestation binding SHALL reject unsolicited binding
+evidence and SHALL NOT claim `cryptographically_bound_to`.
+
 Credential construction SHALL be a pure function of:
 
 ```text
