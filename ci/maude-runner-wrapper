@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# Maude 3.5.1 on macOS prints its version but can retain the GitHub Actions
+# output pipe instead of exiting. Tamarin probes `maude --version` before it
+# starts the real interactive process, so answer that probe deterministically.
+if [ "${1:-}" = "--version" ]; then
+  echo "3.5.1"
+  exit 0
+fi
+
+exec "$HOME/actions-runner-vcissuer/tools/maude-real" "$@"
