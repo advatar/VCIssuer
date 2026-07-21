@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -31,7 +31,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   lean:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
       - uses: leanprover/lean-action@v1
@@ -39,7 +39,7 @@ jobs:
           lake-package-directory: formal/lean
 
   tamarin:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Tamarin prover
@@ -49,8 +49,8 @@ jobs:
         run: tamarin-prover eudi_issuance.spthy --prove
 
   bundle:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
     steps:
       - uses: actions/checkout@v4
       - name: Verify assurance bundle checksums
-        run: sha256sum --check BUNDLE_SHA256SUMS.txt
+        run: shasum -a 256 --check BUNDLE_SHA256SUMS.txt
