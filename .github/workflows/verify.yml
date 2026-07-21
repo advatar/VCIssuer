@@ -1,0 +1,56 @@
+name: Verification gates
+
+on:
+  pull_request:
+  push:
+    branches: [main, agent/add-eudi-issuer-files]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          components: clippy, rustfmt
+      - name: Formatting
+        working-directory: rust
+        run: cargo fmt --all --check
+      - name: Default tests
+        working-directory: rust
+        run: cargo test --workspace --locked
+      - name: Keychain integration tests
+        working-directory: rust
+        run: cargo test --workspace --locked -- --ignored
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  lean:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/lean
+
+  tamarin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Tamarin prover
+        run: brew install tamarin-prover/tap/tamarin-prover@1.12.0 || brew install tamarin-prover/tap/tamarin-prover
+      - name: Prove all issuance lemmas
+        working-directory: formal/tamarin
+        run: tamarin-prover eudi_issuance.spthy --prove
+
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify assurance bundle checksums
+        run: sha256sum --check BUNDLE_SHA256SUMS.txt
