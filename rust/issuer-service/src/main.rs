@@ -256,6 +256,10 @@ fn app(state: AppState) -> Router {
         configured_origins.contains(value)
             || Url::parse(value).ok().is_some_and(|url| {
                 matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+                    || (url.scheme() == "https"
+                        && url
+                            .host_str()
+                            .is_some_and(|host| host.ends_with(".lovable.app")))
             })
     });
 

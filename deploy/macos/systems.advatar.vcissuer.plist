@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>systems.advatar.vcissuer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/johansellstrom/services/vcissuer/rust/target/release/issuer-service</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LISTEN_ADDR</key>
+    <string>0.0.0.0:18080</string>
+    <key>ISSUER_URL</key>
+    <string>https://issuer.advatar.systems</string>
+    <key>CORS_ORIGINS</key>
+    <string>https://issuer.advatar.systems</string>
+    <key>RUST_LOG</key>
+    <string>issuer_service=info</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/johansellstrom/Library/Logs/vcissuer.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/johansellstrom/Library/Logs/vcissuer.log</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/johansellstrom/services/vcissuer</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>

@@ -1,0 +1,10 @@
+issuer.advatar.systems {
+	encode zstd gzip
+	header {
+		Cache-Control "no-store"
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	reverse_proxy host.lima.internal:18080
+}

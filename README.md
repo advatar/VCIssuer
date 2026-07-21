@@ -26,14 +26,15 @@ Run the issuance portal in another terminal:
 ```sh
 cd WebIssuer
 bun install
-VITE_ISSUER_URL=http://127.0.0.1:18080 bun run dev -- --host 127.0.0.1 --port 3000
+VITE_ISSUER_URL=https://issuer.advatar.systems bun run dev -- --host 127.0.0.1 --port 3000
 ```
 
 Open `http://127.0.0.1:3000`. The portal requests a fresh, five-minute
 OpenID4VCI credential offer for each QR code; it does not embed static offers.
-For a hosted Lovable page, set `VITE_ISSUER_URL` to the issuer's public HTTPS
-origin and set `CORS_ORIGINS` on the issuer to the comma-separated permitted UI
-origins.
+The portal defaults to the deployed `https://issuer.advatar.systems` backend.
+`VITE_ISSUER_URL` remains available for an alternate environment. HTTPS
+Lovable origins and local development origins are accepted; other hosted UI
+origins must be listed exactly in the issuer's comma-separated `CORS_ORIGINS`.
 
 Implemented gates currently include issuer and authorization-server metadata,
 signed issuer metadata, PAR, PKCE S256, one-shot authorization codes, DPoP
