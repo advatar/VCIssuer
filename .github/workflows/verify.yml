@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile every Lean theorem
         working-directory: formal/lean
-        run: ~/.elan/bin/lake build
+        run: ~/.elan/toolchains/leanprover--lean4---v4.32.0/bin/lake build
 
   tamarin:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Prove all issuance lemmas
         working-directory: formal/tamarin
-        run: /opt/homebrew/bin/tamarin-prover eudi_issuance.spthy --prove
+        run: PATH=/opt/homebrew/bin:/usr/bin:/bin /opt/homebrew/bin/tamarin-prover eudi_issuance.spthy --prove
 
   bundle:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
