@@ -1,21 +1,17 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/python3
+"""GitHub Actions wrapper for the macOS Maude 3.5.1 executable."""
 
-# Maude 3.5.1 on macOS prints its version but can retain the GitHub Actions
-# output pipe instead of exiting. Tamarin probes `maude --version` before it
-# starts the real interactive process, so answer that probe deterministically.
-if [ "${1:-}" = "--version" ]; then
-  echo "3.5.1"
-  exit 0
-fi
+import os
+import sys
 
-# The self-hosted runner passes its own high-numbered control sockets to child
-# processes. Maude retains them and can wait indefinitely during shutdown.
-# Preserve only the standard streams used by Tamarin's Maude protocol.
-fd=3
-while [ "$fd" -le 255 ]; do
-  eval "exec ${fd}>&-" 2>/dev/null || true
-  fd=$((fd + 1))
-done
 
-exec "$HOME/actions-runner-vcissuer/tools/maude-real" "$@"
+if sys.argv[1:] == ["--version"]:
+    # Maude prints this value but retains the Actions output pipe indefinitely.
+    print("3.5.1")
+    raise SystemExit(0)
+
+# Do not leak the runner's control sockets. Keep stdin/stdout/stderr intact;
+# Tamarin uses those streams for its interactive Maude protocol.
+os.closerange(3, 256)
+binary = os.path.expanduser("~/actions-runner-vcissuer/tools/maude-real")
+os.execv(binary, [binary, *sys.argv[1:]])
