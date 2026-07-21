@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile every Lean theorem
         working-directory: formal/lean
-        run: ~/.elan/toolchains/leanprover--lean4---v4.32.0/bin/lake build
+        run: ~/actions-runner-vcissuer/.elan-local/toolchains/leanprover--lean4---v4.32.0/bin/lake build
 
   tamarin:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
