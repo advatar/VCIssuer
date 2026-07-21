@@ -9,4 +9,13 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 
+# The self-hosted runner passes its own high-numbered control sockets to child
+# processes. Maude retains them and can wait indefinitely during shutdown.
+# Preserve only the standard streams used by Tamarin's Maude protocol.
+fd=3
+while [ "$fd" -le 255 ]; do
+  eval "exec ${fd}>&-" 2>/dev/null || true
+  fd=$((fd + 1))
+done
+
 exec "$HOME/actions-runner-vcissuer/tools/maude-real" "$@"
