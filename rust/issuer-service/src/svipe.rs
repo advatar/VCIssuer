@@ -5,8 +5,39 @@
 //! the resulting credential as development-only.
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 pub const PROFILE: &str = "dev.svipe.pid.sd-jwt";
+#[allow(dead_code)]
+pub const ISSUER: &str = "https://api.svipe.com/oidc/v1";
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct Discovery {
+    pub issuer: Url,
+    pub authorization_endpoint: Url,
+    pub token_endpoint: Url,
+    pub jwks_uri: Url,
+}
+
+#[allow(dead_code)]
+pub async fn discover(client: &reqwest::Client) -> Result<Discovery, String> {
+    let url = format!("{ISSUER}/.well-known/openid-configuration");
+    let discovery = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<Discovery>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if discovery.issuer.as_str().trim_end_matches('/') != ISSUER {
+        return Err("Svipe issuer mismatch".into());
+    }
+    Ok(discovery)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
