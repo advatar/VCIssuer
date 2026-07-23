@@ -6,7 +6,10 @@ OIDC identity proof from Svipe while direct NFC/App Clip proofing is developed.
 
 The typed adapter in `rust/issuer-service/src/svipe.rs` requires the identity
 claims needed by the development PID and a portrait plus
-`validation_portrait_present=true`. It marks normalized evidence with
+`validation_portrait_present=true`. Authorization must request
+`acr_values=document_present face_present:iproov:gpa`; the returned assurance
+context must contain both values, proving a fresh NFC read and iProov GPA
+liveness. It marks normalized evidence with
 `source=svipe_oidc` and `development_only=true`.
 
 This profile is not an authoritative PID profile: it uses a development VCT,

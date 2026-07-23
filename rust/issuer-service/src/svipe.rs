@@ -10,6 +10,7 @@ use url::Url;
 pub const PROFILE: &str = "dev.svipe.pid.sd-jwt";
 #[allow(dead_code)]
 pub const ISSUER: &str = "https://api.svipe.com/oidc/v1";
+pub const REQUIRED_ACR: &str = "document_present face_present:iproov:gpa";
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -49,6 +50,7 @@ pub struct SvipeClaims {
     pub nationality: String,
     pub(crate) document_portrait: Option<String>,
     pub(crate) validation_portrait_present: Option<bool>,
+    pub(crate) acr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +86,10 @@ pub fn normalize(claims: SvipeClaims) -> Result<DevIdentityEvidence, &'static st
     if claims.validation_portrait_present != Some(true) {
         return Err("Svipe portrait-presence validation is required");
     }
+    let acr = claims.acr.as_deref().unwrap_or("");
+    if !(acr.contains("document_present") && acr.contains("face_present:iproov:gpa")) {
+        return Err("Svipe NFC and iProov GPA assurance are both required");
+    }
     Ok(DevIdentityEvidence {
         subject: claims.sub,
         given_name: claims.given_name,
@@ -108,6 +114,7 @@ mod tests {
             nationality: "GB".into(),
             document_portrait: Some("data:image/jpeg;base64,AA==".into()),
             validation_portrait_present: Some(true),
+            acr: Some(REQUIRED_ACR.into()),
         }
     }
     #[test]
