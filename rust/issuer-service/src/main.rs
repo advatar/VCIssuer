@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod signer;
+mod svipe;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -51,6 +52,7 @@ const QEAA_SD_JWT: &str = "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt
 const QEAA_PID_BOUND_SD_JWT: &str =
     "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt:de:pid-bound";
 const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
+const DEV_SVIPE_PID_SD_JWT: &str = svipe::PROFILE;
 
 #[derive(Clone)]
 struct AppState {
@@ -242,6 +244,7 @@ async fn main() {
         EAA_MDOC,
         QEAA_SD_JWT,
         QEAA_PID_BOUND_SD_JWT,
+        DEV_SVIPE_PID_SD_JWT,
     ]
     .into_iter()
     .map(|profile| {
@@ -398,6 +401,7 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
             QEAA_PID_BOUND_SD_JWT: learning_profile(QEAA_PID_BOUND_SD_JWT, "German learning QEAA (cryptographically bound to PID)", true)
+            ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)")
         }
     })
 }
@@ -1404,7 +1408,7 @@ fn authorize_kernel(
 ) -> Result<(), (StatusCode, Json<OAuthError>)> {
     let role = match profile_name {
         PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
-        QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => IssuerRole::Qeaa,
+        QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
         _ => {
             return Err(oauth_error(
@@ -1415,7 +1419,9 @@ fn authorize_kernel(
         }
     };
     let format = match profile_name {
-        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => CredentialFormat::SdJwtVc,
+        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => {
+            CredentialFormat::SdJwtVc
+        }
         PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
@@ -1519,7 +1525,7 @@ fn issue_sd_jwt(
     now: u64,
 ) -> Result<String, (StatusCode, Json<OAuthError>)> {
     let (vct, claims) = match profile {
-        PID_SD_JWT => (
+        PID_SD_JWT | DEV_SVIPE_PID_SD_JWT => (
             "eu.europa.ec.eudi.pid.1",
             vec![
                 ("family_name", json!("Mustermann")),
