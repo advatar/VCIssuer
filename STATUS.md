@@ -19,4 +19,4 @@
 - [x] Bind verified evidence to a short-lived authorization-code offer and the issued credential.
 - [x] Return an EUWallet-compatible by-reference credential-offer deep link.
 - [x] Add adversarial and successful endpoint/issuance tests, document configuration, and pass clippy.
-- [ ] Commit, push, merge to `main`, and verify the implementation is reachable from `origin/main`.
+- [x] Commit, push, merge to `main`, and verify the implementation is reachable from `origin/main`.
