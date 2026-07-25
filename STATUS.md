@@ -1,0 +1,22 @@
+# Status
+
+## PID-bound education credentials
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/2
+- [x] Create wallet interoperability issue: https://github.com/advatar/EUWallet/issues/28
+- [x] Publish distinct bound and independently identified education configurations.
+- [x] Verify PID VP issuer signature, disclosures, validity, subject match and PID-key binding proof.
+- [x] Bind the signing kernel to verified cross-attestation evidence and reject replay/mismatch.
+- [x] Add EUWallet metadata, signing-input, request-assembly and response-validation support.
+- [x] Add focused issuer and wallet tests and run clippy.
+
+## TLSNotary evidence issuance
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/3
+- [x] Define and verify the bounded `tlsn.notary-artifact.v1` contract with a pinned notary key.
+- [x] Reject stale, future, replayed, malformed, wrongly signed, and oversized evidence.
+- [x] Publish a development-only TLS evidence credential configuration without PID/(Q)EAA promotion.
+- [x] Bind verified evidence to a short-lived authorization-code offer and the issued credential.
+- [x] Return an EUWallet-compatible by-reference credential-offer deep link.
+- [x] Add adversarial and successful endpoint/issuance tests, document configuration, and pass clippy.
+- [ ] Commit, push, merge to `main`, and verify the implementation is reachable from `origin/main`.

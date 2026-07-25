@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+"""GitHub Actions wrapper for the macOS Maude 3.5.1 executable."""
+
+import os
+import sys
+
+
+if sys.argv[1:] == ["--version"]:
+    # Maude prints this value but retains the Actions output pipe indefinitely.
+    print("3.5.1")
+    raise SystemExit(0)
+
+# Do not leak the runner's control sockets. Keep stdin/stdout/stderr intact;
+# Tamarin uses those streams for its interactive Maude protocol.
+os.closerange(3, 256)
+binary = os.path.expanduser("~/actions-runner-vcissuer/tools/maude-real")
+os.execv(binary, [binary, *sys.argv[1:]])

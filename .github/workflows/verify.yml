@@ -1,0 +1,53 @@
+name: Verification gates
+
+on:
+  pull_request:
+  push:
+    branches: [main, agent/add-eudi-issuer-files]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Formatting
+        working-directory: rust
+        run: ~/.cargo/bin/cargo +1.97.0 fmt --all --check
+      - name: Default tests
+        working-directory: rust
+        run: ~/.cargo/bin/cargo +1.97.0 test --workspace --locked
+      - name: Clippy
+        working-directory: rust
+        run: ~/.cargo/bin/cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Deployed Keychain signer smoke test
+        run: |
+          metadata=$(curl --fail --silent --show-error https://issuer.advatar.systems/.well-known/openid-credential-issuer)
+          test "$(jq -r '.signed_metadata | split(".") | length' <<<"$metadata")" = 3
+          test "$(curl --fail --silent --show-error https://issuer.advatar.systems/jwks.json | jq '.keys | length')" = 5
+
+  lean:
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile every Lean theorem
+        working-directory: formal/lean
+        run: ~/actions-runner-vcissuer/.elan-local/toolchains/leanprover--lean4---v4.32.0/bin/lake build
+
+  tamarin:
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove all issuance lemmas
+        run: |
+          ssh -i ~/actions-runner-vcissuer/tamarin-ci-key -o BatchMode=yes johansellstrom@127.0.0.1 \
+            'cd ~/actions-runner-vcissuer/_work/VCIssuer/VCIssuer/formal/tamarin && MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove'
+
+  bundle:
+    runs-on: [self-hosted, macOS, ARM64, vcissuer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify assurance bundle checksums
+        run: shasum -a 256 --check BUNDLE_SHA256SUMS.txt
