@@ -53,10 +53,16 @@ const QEAA_PID_BOUND_SD_JWT: &str =
     "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt:de:pid-bound";
 const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
 const DEV_SVIPE_PID_SD_JWT: &str = svipe::PROFILE;
+const TLSN_EVIDENCE_SD_JWT: &str = "dev.advatar.tlsn.evidence.sd-jwt";
+const TLSN_EVIDENCE_VCT: &str = "dev.advatar.tlsn.evidence.1";
+const TLSN_ARTIFACT_VERSION: &str = "tlsn.notary-artifact.v1";
+const MAX_TLSN_ARTIFACT_BYTES: usize = 256 * 1024;
+const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
 
 #[derive(Clone)]
 struct AppState {
     issuer: Url,
+    trusted_notary_key: Vec<u8>,
     inner: Arc<Mutex<VolatileState>>,
     #[cfg(target_os = "macos")]
     metadata_signer: Arc<KeychainSigner>,
@@ -73,6 +79,7 @@ struct VolatileState {
     dpop_jtis: HashSet<String>,
     binding_jtis: HashSet<String>,
     offers: HashMap<String, CredentialOffer>,
+    tlsn_sessions: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -82,6 +89,7 @@ struct PushedAuthorization {
     scope: String,
     state: Option<String>,
     code_challenge: String,
+    tlsn_evidence: Option<VerifiedTlsnEvidence>,
 }
 
 struct AuthorizationCode {
@@ -90,17 +98,20 @@ struct AuthorizationCode {
     scope: String,
     code_challenge: String,
     consumed: bool,
+    tlsn_evidence: Option<VerifiedTlsnEvidence>,
 }
 
 struct AccessToken {
     scope: String,
     dpop_jkt: String,
+    tlsn_evidence: Option<VerifiedTlsnEvidence>,
 }
 
 struct CredentialOffer {
     profile: String,
     issuer_state: String,
     expires_at: u64,
+    tlsn_evidence: Option<VerifiedTlsnEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +136,37 @@ struct CreateOfferResponse {
     credential_offer_uri: String,
     deep_link: String,
     expires_in: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsnEvidenceOfferRequest {
+    artifact: SignedTlsnArtifact,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SignedTlsnArtifact {
+    payload: TlsnArtifactPayload,
+    algorithm: String,
+    public_key: String,
+    signature: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TlsnArtifactPayload {
+    version: String,
+    session_id: String,
+    issued_at: u64,
+    verifier_output: Value,
+}
+
+#[derive(Clone)]
+struct VerifiedTlsnEvidence {
+    session_id: String,
+    issued_at: u64,
+    verifier_output: Value,
 }
 
 #[derive(Serialize)]
@@ -232,6 +274,12 @@ async fn main() {
 
     let issuer = std::env::var("ISSUER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let issuer = Url::parse(&issuer).expect("ISSUER_URL must be an absolute URL");
+    let trusted_notary_key = std::env::var("TLSN_TRUSTED_NOTARY_KEY")
+        .expect("TLSN_TRUSTED_NOTARY_KEY must contain the hex SEC1 P-256 notary public key");
+    let trusted_notary_key =
+        hex::decode(trusted_notary_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
+    VerifyingKey::from_sec1_bytes(&trusted_notary_key)
+        .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
     let address: SocketAddr = std::env::var("LISTEN_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
@@ -245,6 +293,7 @@ async fn main() {
         QEAA_SD_JWT,
         QEAA_PID_BOUND_SD_JWT,
         DEV_SVIPE_PID_SD_JWT,
+        TLSN_EVIDENCE_SD_JWT,
     ]
     .into_iter()
     .map(|profile| {
@@ -258,6 +307,7 @@ async fn main() {
 
     let app = app(AppState {
         issuer,
+        trusted_notary_key,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
         metadata_signer: Arc::new(
@@ -310,6 +360,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/jwks.json", get(jwks))
         .route("/credential-offers", post(create_credential_offer))
+        .route(
+            "/evidence-offers/tlsnotary",
+            post(create_tlsn_evidence_offer),
+        )
         .route("/credential-offer/{id}", get(get_credential_offer))
         .route("/par", post(par))
         .route("/authorize", get(authorize))
@@ -401,7 +455,8 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
             QEAA_PID_BOUND_SD_JWT: learning_profile(QEAA_PID_BOUND_SD_JWT, "German learning QEAA (cryptographically bound to PID)", true)
-            ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)")
+            ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)"),
+            TLSN_EVIDENCE_SD_JWT: sd_jwt_profile(TLSN_EVIDENCE_SD_JWT, TLSN_EVIDENCE_VCT, "TLSNotary web evidence (development)")
         }
     })
 }
@@ -502,6 +557,7 @@ async fn par(
             "scope contains an unsupported credential",
         ));
     }
+    let mut tlsn_evidence = None;
     if let Some(issuer_state) = request.issuer_state.as_deref() {
         let now = unix_time()?;
         let inner = state.inner.lock().await;
@@ -528,6 +584,7 @@ async fn par(
                 "credential offer is expired or does not match the requested scope",
             ));
         }
+        tlsn_evidence = offer.tlsn_evidence.clone();
     }
     let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::new_v4());
     state.inner.lock().await.pushed.insert(
@@ -538,6 +595,7 @@ async fn par(
             scope: request.scope,
             state: request.state,
             code_challenge: request.code_challenge,
+            tlsn_evidence,
         },
     );
     Ok(Json(ParResponse {
@@ -550,6 +608,13 @@ async fn create_credential_offer(
     State(state): State<AppState>,
     Json(request): Json<CreateOfferRequest>,
 ) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
+    if request.credential_configuration_id == TLSN_EVIDENCE_SD_JWT {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "TLSNotary evidence offers require verified evidence",
+        ));
+    }
     if !valid_scope(&request.credential_configuration_id)
         || request.credential_configuration_id.contains(' ')
     {
@@ -569,8 +634,47 @@ async fn create_credential_offer(
             profile: request.credential_configuration_id,
             issuer_state,
             expires_at,
+            tlsn_evidence: None,
         },
     );
+    let credential_offer_uri = state
+        .issuer
+        .join(&format!("credential-offer/{id}"))
+        .expect("opaque offer ID creates a valid URL")
+        .to_string();
+    let mut deep_link = Url::parse("openid-credential-offer://").expect("static URL is valid");
+    deep_link
+        .query_pairs_mut()
+        .append_pair("credential_offer_uri", &credential_offer_uri);
+    Ok(Json(CreateOfferResponse {
+        credential_offer_uri,
+        deep_link: deep_link.to_string(),
+        expires_in,
+    }))
+}
+
+async fn create_tlsn_evidence_offer(
+    State(state): State<AppState>,
+    Json(request): Json<TlsnEvidenceOfferRequest>,
+) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
+    let now = unix_time()?;
+    let evidence = verify_tlsn_artifact(&request.artifact, &state.trusted_notary_key, now)?;
+    let id = Uuid::new_v4().to_string();
+    let issuer_state = random_token();
+    let expires_in = TLSN_EVIDENCE_LIFETIME_SECONDS;
+    let expires_at = now.saturating_add(expires_in);
+    let mut inner = state.inner.lock().await;
+    reserve_tlsn_session(&mut inner.tlsn_sessions, &evidence.session_id)?;
+    inner.offers.insert(
+        id.clone(),
+        CredentialOffer {
+            profile: TLSN_EVIDENCE_SD_JWT.into(),
+            issuer_state,
+            expires_at,
+            tlsn_evidence: Some(evidence),
+        },
+    );
+    drop(inner);
     let credential_offer_uri = state
         .issuer
         .join(&format!("credential-offer/{id}"))
@@ -651,6 +755,7 @@ async fn authorize(
             scope: pushed.scope,
             code_challenge: pushed.code_challenge,
             consumed: false,
+            tlsn_evidence: pushed.tlsn_evidence,
         },
     );
     let mut redirect = pushed.redirect_uri;
@@ -716,12 +821,14 @@ async fn token(
     }
     code.consumed = true;
     let scope = code.scope.clone();
+    let tlsn_evidence = code.tlsn_evidence.clone();
     let access_token = random_token();
     inner.tokens.insert(
         access_token.clone(),
         AccessToken {
             scope: scope.clone(),
             dpop_jkt: verified_dpop.jkt,
+            tlsn_evidence,
         },
     );
     Ok(Json(json!({
@@ -835,6 +942,14 @@ async fn credential(
         ));
     }
     let now = unix_time()?;
+    let tlsn_evidence = access.tlsn_evidence.clone();
+    if request.credential_configuration_id == TLSN_EVIDENCE_SD_JWT && tlsn_evidence.is_none() {
+        return Err(oauth_error(
+            StatusCode::FORBIDDEN,
+            "credential_request_denied",
+            "TLSNotary evidence was not bound to this authorization",
+        ));
+    }
     let pid_binding = match request.credential_configuration_id.as_str() {
         QEAA_PID_BOUND_SD_JWT => {
             let supplied = request.pid_binding.as_ref().ok_or_else(|| {
@@ -895,7 +1010,7 @@ async fn credential(
     drop(inner);
 
     match request.credential_configuration_id.as_str() {
-        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => {
+        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | TLSN_EVIDENCE_SD_JWT => {
             #[cfg(target_os = "macos")]
             {
                 let signer = state
@@ -908,6 +1023,7 @@ async fn credential(
                     &request.credential_configuration_id,
                     &verified_proof.holder_jwk,
                     now,
+                    tlsn_evidence.as_ref(),
                 )?;
                 Ok(Json(json!({"credentials": [{"credential": credential}]})))
             }
@@ -955,6 +1071,8 @@ fn valid_scope(scope: &str) -> bool {
         EAA_MDOC,
         QEAA_SD_JWT,
         QEAA_PID_BOUND_SD_JWT,
+        DEV_SVIPE_PID_SD_JWT,
+        TLSN_EVIDENCE_SD_JWT,
     ];
     let mut count = 0;
     for item in scope.split_ascii_whitespace() {
@@ -972,6 +1090,9 @@ fn key_label(profile: &str) -> &'static str {
         PID_MDOC => "pid-mdoc",
         EAA_MDOC => "eaa-mdoc",
         QEAA_SD_JWT => "qeaa-sd-jwt",
+        QEAA_PID_BOUND_SD_JWT => "qeaa-pid-bound-sd-jwt",
+        DEV_SVIPE_PID_SD_JWT => "svipe-pid-sd-jwt",
+        TLSN_EVIDENCE_SD_JWT => "tlsn-evidence-sd-jwt",
         _ => unreachable!("only closed profile identifiers are used"),
     }
 }
@@ -1398,6 +1519,107 @@ fn unix_time() -> Result<u64, (StatusCode, Json<OAuthError>)> {
         })
 }
 
+fn verify_tlsn_artifact(
+    artifact: &SignedTlsnArtifact,
+    trusted_key: &[u8],
+    now: u64,
+) -> Result<VerifiedTlsnEvidence, (StatusCode, Json<OAuthError>)> {
+    if artifact.payload.version != TLSN_ARTIFACT_VERSION || artifact.algorithm != "ES256" {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "unsupported TLSNotary artifact version or algorithm",
+        ));
+    }
+    if artifact.payload.session_id.is_empty()
+        || artifact.payload.session_id.len() > 256
+        || artifact.payload.issued_at > now.saturating_add(5)
+        || now.saturating_sub(artifact.payload.issued_at) > TLSN_EVIDENCE_LIFETIME_SECONDS
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "TLSNotary artifact is stale, future-dated, or has an invalid session identifier",
+        ));
+    }
+    let message = serde_json::to_vec(&artifact.payload).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "TLSNotary artifact payload cannot be encoded",
+        )
+    })?;
+    if message.len() > MAX_TLSN_ARTIFACT_BYTES {
+        return Err(oauth_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_evidence",
+            "TLSNotary artifact exceeds the accepted size",
+        ));
+    }
+    let embedded_key = URL_SAFE_NO_PAD.decode(&artifact.public_key).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "TLSNotary public key is malformed",
+        )
+    })?;
+    if embedded_key.as_slice().ct_eq(trusted_key).unwrap_u8() != 1 {
+        return Err(oauth_error(
+            StatusCode::FORBIDDEN,
+            "invalid_evidence",
+            "TLSNotary artifact was not signed by the configured notary",
+        ));
+    }
+    let signature = URL_SAFE_NO_PAD.decode(&artifact.signature).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "TLSNotary signature is malformed",
+        )
+    })?;
+    let signature = Signature::from_slice(&signature).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_evidence",
+            "TLSNotary signature has an invalid length",
+        )
+    })?;
+    let key = VerifyingKey::from_sec1_bytes(trusted_key).map_err(|_| {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "configured TLSNotary key is invalid",
+        )
+    })?;
+    key.verify(&message, &signature).map_err(|_| {
+        oauth_error(
+            StatusCode::FORBIDDEN,
+            "invalid_evidence",
+            "TLSNotary artifact signature verification failed",
+        )
+    })?;
+    Ok(VerifiedTlsnEvidence {
+        session_id: artifact.payload.session_id.clone(),
+        issued_at: artifact.payload.issued_at,
+        verifier_output: artifact.payload.verifier_output.clone(),
+    })
+}
+
+fn reserve_tlsn_session(
+    sessions: &mut HashSet<String>,
+    session_id: &str,
+) -> Result<(), (StatusCode, Json<OAuthError>)> {
+    if sessions.insert(session_id.to_owned()) {
+        Ok(())
+    } else {
+        Err(oauth_error(
+            StatusCode::CONFLICT,
+            "invalid_request",
+            "TLSNotary session has already created an issuance offer",
+        ))
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn authorize_kernel(
     profile_name: &str,
@@ -1410,6 +1632,7 @@ fn authorize_kernel(
         PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
+        TLSN_EVIDENCE_SD_JWT => IssuerRole::DevelopmentEvidence,
         _ => {
             return Err(oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -1419,9 +1642,11 @@ fn authorize_kernel(
         }
     };
     let format = match profile_name {
-        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => {
-            CredentialFormat::SdJwtVc
-        }
+        PID_SD_JWT
+        | QEAA_SD_JWT
+        | QEAA_PID_BOUND_SD_JWT
+        | DEV_SVIPE_PID_SD_JWT
+        | TLSN_EVIDENCE_SD_JWT => CredentialFormat::SdJwtVc,
         PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
@@ -1523,6 +1748,7 @@ fn issue_sd_jwt(
     profile: &str,
     holder_jwk: &Value,
     now: u64,
+    tlsn_evidence: Option<&VerifiedTlsnEvidence>,
 ) -> Result<String, (StatusCode, Json<OAuthError>)> {
     let (vct, claims) = match profile {
         PID_SD_JWT | DEV_SVIPE_PID_SD_JWT => (
@@ -1544,6 +1770,18 @@ fn issue_sd_jwt(
                 ("issuing_country", json!("DE")),
             ],
         ),
+        TLSN_EVIDENCE_SD_JWT => {
+            let evidence = tlsn_evidence.expect("TLSNotary profile checked evidence binding");
+            (
+                TLSN_EVIDENCE_VCT,
+                vec![
+                    ("tlsn_session_id", json!(evidence.session_id)),
+                    ("tlsn_issued_at", json!(evidence.issued_at)),
+                    ("tlsn_verifier_output", evidence.verifier_output.clone()),
+                    ("assurance", json!("tlsnotary-development-evidence")),
+                ],
+            )
+        }
         _ => unreachable!("only SD-JWT profiles call this encoder"),
     };
     let mut disclosures = Vec::new();
@@ -2046,8 +2284,84 @@ mod tests {
     #[test]
     fn scope_is_closed() {
         assert!(valid_scope(PID_SD_JWT));
+        assert!(valid_scope(TLSN_EVIDENCE_SD_JWT));
         assert!(!valid_scope("openid unknown"));
         assert!(!valid_scope(""));
+    }
+
+    fn tlsn_artifact(key: &SigningKey, issued_at: u64) -> SignedTlsnArtifact {
+        let payload = TlsnArtifactPayload {
+            version: TLSN_ARTIFACT_VERSION.into(),
+            session_id: "tlsn-session-1".into(),
+            issued_at,
+            verifier_output: json!({"serverName":"example.com","status":200}),
+        };
+        let signature: Signature =
+            key.sign(&serde_json::to_vec(&payload).expect("artifact payload must serialize"));
+        SignedTlsnArtifact {
+            payload,
+            algorithm: "ES256".into(),
+            public_key: URL_SAFE_NO_PAD
+                .encode(key.verifying_key().to_encoded_point(false).as_bytes()),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }
+    }
+
+    #[test]
+    fn tlsn_artifact_is_pinned_fresh_and_tamper_evident() {
+        let now = unix_time().expect("clock");
+        let key = SigningKey::from_slice(&[7; 32]).expect("test key");
+        let trusted = key.verifying_key().to_encoded_point(false);
+        let artifact = tlsn_artifact(&key, now);
+        let verified =
+            verify_tlsn_artifact(&artifact, trusted.as_bytes(), now).expect("valid artifact");
+        assert_eq!(verified.session_id, "tlsn-session-1");
+
+        let wrong = SigningKey::from_slice(&[9; 32]).expect("other test key");
+        assert!(
+            verify_tlsn_artifact(
+                &artifact,
+                wrong.verifying_key().to_encoded_point(false).as_bytes(),
+                now
+            )
+            .is_err()
+        );
+
+        let mut tampered = artifact.clone();
+        tampered.payload.verifier_output["status"] = json!(500);
+        assert!(verify_tlsn_artifact(&tampered, trusted.as_bytes(), now).is_err());
+        assert!(
+            verify_tlsn_artifact(
+                &tlsn_artifact(&key, now - TLSN_EVIDENCE_LIFETIME_SECONDS - 1),
+                trusted.as_bytes(),
+                now
+            )
+            .is_err()
+        );
+        assert!(
+            verify_tlsn_artifact(&tlsn_artifact(&key, now + 6), trusted.as_bytes(), now).is_err()
+        );
+    }
+
+    #[test]
+    fn tlsn_profile_requires_evidence_bound_authorization() {
+        let evidence = VerifiedTlsnEvidence {
+            session_id: "session".into(),
+            issued_at: 1,
+            verifier_output: json!({"ok":true}),
+        };
+        let offer = CredentialOffer {
+            profile: TLSN_EVIDENCE_SD_JWT.into(),
+            issuer_state: "state".into(),
+            expires_at: 2,
+            tlsn_evidence: Some(evidence),
+        };
+        assert!(offer.tlsn_evidence.is_some());
+        assert_eq!(offer.profile, TLSN_EVIDENCE_SD_JWT);
+
+        let mut sessions = HashSet::new();
+        reserve_tlsn_session(&mut sessions, "session").expect("first reservation");
+        assert!(reserve_tlsn_session(&mut sessions, "session").is_err());
     }
 
     #[test]

@@ -17,6 +17,7 @@ Run it locally:
 cd rust
 LISTEN_ADDR=127.0.0.1:18080 \
 ISSUER_URL=http://127.0.0.1:18080 \
+TLSN_TRUSTED_NOTARY_KEY=<hex-uncompressed-sec1-p256-public-key> \
 RUST_LOG=issuer_service=info \
 cargo run -p issuer-service
 ```
@@ -118,3 +119,16 @@ The phrase “all code verified” must be made precise. The recommended product
 
 Here, “wallet issuer” is interpreted as a **Credential Issuer / PID Provider / Attestation Provider that issues into an EUDI Wallet Unit**. It is not the Wallet Provider that supplies the Wallet Solution. A deployment must select one or more explicit issuer roles and credential rulebooks; there is no unconstrained “generic credential” production profile.
 # VCIssuer
+
+## TLSNotary development evidence
+
+`POST /evidence-offers/tlsnotary` accepts
+`{"artifact": <tlsn.notary-artifact.v1>}`. The service verifies the artifact's
+ES256 signature against `TLSN_TRUSTED_NOTARY_KEY`, enforces a five-minute
+freshness window and one offer per notary session, and returns
+`credential_offer_uri`, `deep_link`, and `expires_in`. The authorization-code
+flow carries the verified evidence through PAR, token exchange, and signing.
+
+The resulting SD-JWT VC uses `vct=dev.advatar.tlsn.evidence.1`. It is
+development web evidence only and must never be interpreted as PID, EAA, QEAA,
+regulated KYC, or an accredited identity assertion.

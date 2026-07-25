@@ -87,7 +87,10 @@ pub fn normalize(claims: SvipeClaims) -> Result<DevIdentityEvidence, &'static st
         return Err("Svipe portrait-presence validation is required");
     }
     let acr = claims.acr.as_deref().unwrap_or("");
-    if !(acr.contains("document_present") && acr.contains("face_present:iproov:gpa")) {
+    if !REQUIRED_ACR
+        .split_ascii_whitespace()
+        .all(|required| acr.split_ascii_whitespace().any(|value| value == required))
+    {
         return Err("Svipe NFC and iProov GPA assurance are both required");
     }
     Ok(DevIdentityEvidence {

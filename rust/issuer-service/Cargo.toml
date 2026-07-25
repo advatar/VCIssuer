@@ -10,6 +10,7 @@ publish = false
 axum = { version = "0.8.4", features = ["json", "query"] }
 base64 = "0.22.1"
 ciborium = "0.2.2"
+hex = "0.4.3"
 issuer-core = { path = "../issuer-core" }
 rand = "0.9.2"
 reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }

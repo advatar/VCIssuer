@@ -29,6 +29,7 @@ pub enum IssuerRole {
     Qeaa,
     PublicBodyEaa,
     NonQualifiedEaa,
+    DevelopmentEvidence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +152,10 @@ pub enum DecisionError {
 pub const fn role_evidence_ok(role: IssuerRole, subject: SubjectEvidence) -> bool {
     match role {
         IssuerRole::Pid => subject.loa_high,
-        IssuerRole::Qeaa | IssuerRole::PublicBodyEaa | IssuerRole::NonQualifiedEaa => true,
+        IssuerRole::Qeaa
+        | IssuerRole::PublicBodyEaa
+        | IssuerRole::NonQualifiedEaa
+        | IssuerRole::DevelopmentEvidence => true,
     }
 }
 
