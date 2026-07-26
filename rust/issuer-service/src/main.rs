@@ -848,7 +848,7 @@ async fn token(
 }
 
 async fn nonce(State(state): State<AppState>) -> Json<Value> {
-    let nonce = random_token();
+    let nonce = random_credential_nonce();
     state.inner.lock().await.nonces.insert(nonce.clone(), false);
     Json(json!({"c_nonce": nonce, "c_nonce_expires_in": 300}))
 }
@@ -1118,6 +1118,15 @@ fn random_token() -> String {
     let mut value = [0_u8; 32];
     rand::rng().fill_bytes(&mut value);
     URL_SAFE_NO_PAD.encode(value)
+}
+
+fn random_credential_nonce() -> String {
+    loop {
+        let value = rand::rng().next_u64();
+        if value != 0 {
+            return value.to_string();
+        }
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<OAuthError>)> {
@@ -2295,6 +2304,18 @@ mod tests {
         assert!(valid_scope(TLSN_EVIDENCE_SD_JWT));
         assert!(!valid_scope("openid unknown"));
         assert!(!valid_scope(""));
+    }
+
+    #[test]
+    fn credential_nonces_are_nonzero_canonical_decimal_u64_values() {
+        let mut observed = HashSet::new();
+        for _ in 0..128 {
+            let nonce = random_credential_nonce();
+            let parsed = nonce.parse::<u64>().expect("decimal u64 nonce");
+            assert_ne!(parsed, 0);
+            assert_eq!(parsed.to_string(), nonce);
+            assert!(observed.insert(nonce));
+        }
     }
 
     #[test]
