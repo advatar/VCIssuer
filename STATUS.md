@@ -36,4 +36,4 @@
 - [x] Emit a cryptographically random non-zero `u64` as canonical decimal `c_nonce` text.
 - [x] Preserve exact nonce proof binding and one-use replay rejection.
 - [x] Add focused tests and pass formatting, tests, and clippy.
-- [ ] Merge to `main`, verify reachability, and delete the branch.
+- [x] Merge to `main`, verify reachability, and delete the branch.
