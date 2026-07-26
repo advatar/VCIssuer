@@ -44,4 +44,4 @@
 - [x] Create a development attestation CA and exact-issuer TLSNotary signing leaf.
 - [x] Publish and advertise the bounded leaf/root path without reusing the HTTPS identity.
 - [x] Test key/profile binding and pass tests/clippy.
-- [ ] Merge, verify `origin/main`, and delete the branch.
+- [x] Merge, verify `origin/main`, and delete the branch.
