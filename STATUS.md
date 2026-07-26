@@ -20,3 +20,12 @@
 - [x] Return an EUWallet-compatible by-reference credential-offer deep link.
 - [x] Add adversarial and successful endpoint/issuance tests, document configuration, and pass clippy.
 - [x] Commit, push, merge to `main`, and verify the implementation is reachable from `origin/main`.
+
+## Final OID4VCI credential-proof request interoperability
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/5
+- [ ] Accept exactly one JWT proof from the final `proofs.jwt` array request shape.
+- [ ] Reject missing, empty, multiple, unknown, and legacy ambiguous proof shapes.
+- [ ] Preserve nonce, audience, holder-key, and DPoP binding validation.
+- [ ] Add successful and adversarial endpoint tests and pass formatting, tests, and clippy.
+- [ ] Commit, push, merge to `main`, and delete the implementation branch.
