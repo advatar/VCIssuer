@@ -24,8 +24,8 @@
 ## Final OID4VCI credential-proof request interoperability
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/5
-- [ ] Accept exactly one JWT proof from the final `proofs.jwt` array request shape.
-- [ ] Reject missing, empty, multiple, unknown, and legacy ambiguous proof shapes.
-- [ ] Preserve nonce, audience, holder-key, and DPoP binding validation.
-- [ ] Add successful and adversarial endpoint tests and pass formatting, tests, and clippy.
+- [x] Accept exactly one JWT proof from the final `proofs.jwt` array request shape.
+- [x] Reject missing, empty, multiple, unknown, and legacy ambiguous proof shapes.
+- [x] Preserve nonce, audience, holder-key, and DPoP binding validation.
+- [x] Add successful and adversarial endpoint tests and pass formatting, tests, and clippy.
 - [ ] Commit, push, merge to `main`, and delete the implementation branch.
