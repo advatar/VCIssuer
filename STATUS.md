@@ -45,3 +45,10 @@
 - [x] Publish and advertise the bounded leaf/root path without reusing the HTTPS identity.
 - [x] Test key/profile binding and pass tests/clippy.
 - [x] Merge, verify `origin/main`, and delete the branch.
+
+## Mandatory PAR discovery metadata
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/11
+- [x] Advertise the PAR requirement in authorization-server metadata.
+- [x] Add a regression test and pass tests/clippy.
+- [x] Merge, verify `origin/main`, and delete the branch.
