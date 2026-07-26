@@ -37,3 +37,10 @@
 - [x] Preserve exact nonce proof binding and one-use replay rejection.
 - [x] Add focused tests and pass formatting, tests, and clippy.
 - [x] Merge to `main`, verify reachability, and delete the branch.
+
+## Development credential-signing certificate path
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/9
+- [ ] Create a development attestation CA and exact-issuer TLSNotary signing leaf.
+- [ ] Publish and advertise the bounded leaf/root path without reusing the HTTPS identity.
+- [ ] Test key/profile binding, pass tests/clippy, merge, and delete the branch.
