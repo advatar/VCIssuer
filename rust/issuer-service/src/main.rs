@@ -191,10 +191,24 @@ struct TokenRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CredentialRequest {
     credential_configuration_id: String,
-    proof: CredentialProofObject,
+    proofs: CredentialProofs,
     pid_binding: Option<PidBindingObject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialProofs {
+    jwt: Vec<String>,
+}
+
+fn single_credential_proof(proofs: &CredentialProofs) -> Option<&str> {
+    let [proof] = proofs.jwt.as_slice() else {
+        return None;
+    };
+    Some(proof)
 }
 
 #[derive(Deserialize)]
@@ -216,12 +230,6 @@ struct BindingProofClaims {
 struct VerifiedPidBinding {
     subject: SubjectId,
     jti: String,
-}
-
-#[derive(Deserialize)]
-struct CredentialProofObject {
-    proof_type: String,
-    jwt: String,
 }
 
 #[derive(Deserialize)]
@@ -906,14 +914,14 @@ async fn credential(
             "credential is outside the authorized scope",
         ));
     }
-    if request.proof.proof_type != "jwt" {
-        return Err(oauth_error(
+    let credential_proof = single_credential_proof(&request.proofs).ok_or_else(|| {
+        oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_proof",
-            "a JWT credential proof is required",
-        ));
-    }
-    let verified_proof = verify_credential_proof(&request.proof.jwt, &state.issuer)?;
+            "exactly one JWT credential proof is required",
+        )
+    })?;
+    let verified_proof = verify_credential_proof(credential_proof, &state.issuer)?;
     if access
         .dpop_jkt
         .as_bytes()
@@ -2287,6 +2295,44 @@ mod tests {
         assert!(valid_scope(TLSN_EVIDENCE_SD_JWT));
         assert!(!valid_scope("openid unknown"));
         assert!(!valid_scope(""));
+    }
+
+    #[test]
+    fn credential_request_accepts_only_the_final_single_jwt_proof_shape() {
+        let valid: CredentialRequest = serde_json::from_value(json!({
+            "credential_configuration_id": TLSN_EVIDENCE_SD_JWT,
+            "proofs": {"jwt": ["header.payload.signature"]}
+        }))
+        .expect("final proof array shape");
+        assert_eq!(valid.proofs.jwt, ["header.payload.signature"]);
+
+        for invalid in [
+            json!({
+                "credential_configuration_id": TLSN_EVIDENCE_SD_JWT,
+                "proofs": {"jwt": []}
+            }),
+            json!({
+                "credential_configuration_id": TLSN_EVIDENCE_SD_JWT,
+                "proofs": {"jwt": ["one", "two"]}
+            }),
+            json!({
+                "credential_configuration_id": TLSN_EVIDENCE_SD_JWT,
+                "proof": {"proof_type": "jwt", "jwt": "legacy"}
+            }),
+            json!({
+                "credential_configuration_id": TLSN_EVIDENCE_SD_JWT,
+                "proofs": {"jwt": ["proof"], "unexpected": []}
+            }),
+        ] {
+            let parsed = serde_json::from_value::<CredentialRequest>(invalid);
+            assert!(
+                parsed
+                    .as_ref()
+                    .ok()
+                    .and_then(|request| single_credential_proof(&request.proofs))
+                    .is_none()
+            );
+        }
     }
 
     fn tlsn_artifact(key: &SigningKey, issued_at: u64) -> SignedTlsnArtifact {
