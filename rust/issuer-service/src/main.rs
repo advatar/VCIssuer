@@ -19,7 +19,10 @@ use axum::{
     response::Redirect,
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use ciborium::value::Value as CborValue;
 use issuer_core::{
     Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Evidence,
@@ -68,6 +71,8 @@ struct AppState {
     metadata_signer: Arc<KeychainSigner>,
     #[cfg(target_os = "macos")]
     credential_signers: Arc<HashMap<&'static str, KeychainSigner>>,
+    #[cfg(target_os = "macos")]
+    development_signing_chains: Arc<HashMap<&'static str, Vec<Vec<u8>>>>,
 }
 
 #[derive(Default)]
@@ -313,6 +318,17 @@ async fn main() {
     })
     .collect();
 
+    #[cfg(target_os = "macos")]
+    let development_signing_chains = HashMap::from([(
+        TLSN_EVIDENCE_SD_JWT,
+        KeychainSigner::development_certificate_chain(
+            "dev.advatar.vcissuer.development-attestation-ca",
+            &format!("dev.advatar.vcissuer.{}", key_label(TLSN_EVIDENCE_SD_JWT)),
+            issuer.as_str(),
+        )
+        .expect("TLSNotary development signing certificate chain must be available"),
+    )]);
+
     let app = app(AppState {
         issuer,
         trusted_notary_key,
@@ -324,6 +340,8 @@ async fn main() {
         ),
         #[cfg(target_os = "macos")]
         credential_signers: Arc::new(credential_signers),
+        #[cfg(target_os = "macos")]
+        development_signing_chains: Arc::new(development_signing_chains),
     });
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -367,6 +385,10 @@ fn app(state: AppState) -> Router {
             get(oauth_metadata),
         )
         .route("/jwks.json", get(jwks))
+        .route(
+            "/credential-signing-certificates/{configuration_id}",
+            get(credential_signing_certificates),
+        )
         .route("/credential-offers", post(create_credential_offer))
         .route(
             "/evidence-offers/tlsnotary",
@@ -451,6 +473,7 @@ async fn issuer_metadata(
 
 fn issuer_metadata_value(state: &AppState) -> Value {
     let issuer = state.issuer.as_str().trim_end_matches('/');
+    let tlsn_profile = tlsn_metadata_profile(issuer);
     json!({
         "credential_issuer": issuer,
         "authorization_servers": [issuer],
@@ -464,9 +487,48 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
             QEAA_PID_BOUND_SD_JWT: learning_profile(QEAA_PID_BOUND_SD_JWT, "German learning QEAA (cryptographically bound to PID)", true)
             ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)"),
-            TLSN_EVIDENCE_SD_JWT: sd_jwt_profile(TLSN_EVIDENCE_SD_JWT, TLSN_EVIDENCE_VCT, "TLSNotary web evidence (development)")
+            TLSN_EVIDENCE_SD_JWT: tlsn_profile
         }
     })
+}
+
+fn tlsn_metadata_profile(issuer: &str) -> Value {
+    let mut tlsn_profile = sd_jwt_profile(
+        TLSN_EVIDENCE_SD_JWT,
+        TLSN_EVIDENCE_VCT,
+        "TLSNotary web evidence (development)",
+    );
+    tlsn_profile
+        .as_object_mut()
+        .expect("profile is an object")
+        .insert(
+            "credential_signing_certificate_endpoint".into(),
+            json!(format!(
+                "{issuer}/credential-signing-certificates/{TLSN_EVIDENCE_SD_JWT}"
+            )),
+        );
+    tlsn_profile
+}
+
+#[cfg(target_os = "macos")]
+async fn credential_signing_certificates(
+    State(state): State<AppState>,
+    Path(configuration_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let chain = state
+        .development_signing_chains
+        .get(configuration_id.as_str())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({
+        "credential_configuration_id": configuration_id,
+        "x5c": chain.iter().map(|der| STANDARD.encode(der)).collect::<Vec<_>>(),
+        "development_only": true
+    })))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn credential_signing_certificates(Path(_configuration_id): Path<String>) -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 fn learning_profile(configuration_id: &str, name: &str, pid_bound: bool) -> Value {
@@ -2304,6 +2366,16 @@ mod tests {
         assert!(valid_scope(TLSN_EVIDENCE_SD_JWT));
         assert!(!valid_scope("openid unknown"));
         assert!(!valid_scope(""));
+    }
+
+    #[test]
+    fn tlsn_metadata_advertises_a_profile_bound_certificate_endpoint() {
+        let profile = tlsn_metadata_profile("https://issuer.example");
+        assert_eq!(profile["vct"], TLSN_EVIDENCE_VCT);
+        assert_eq!(
+            profile["credential_signing_certificate_endpoint"],
+            "https://issuer.example/credential-signing-certificates/dev.advatar.tlsn.evidence.sd-jwt"
+        );
     }
 
     #[test]

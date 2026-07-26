@@ -7,8 +7,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::ecdsa::Signature;
 use rcgen::{
-    CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, RemoteKeyPair, SerialNumber,
-    SignatureAlgorithm,
+    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose,
+    RemoteKeyPair, SanType, SerialNumber, SignatureAlgorithm,
 };
 use security_framework::{
     item::{ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult},
@@ -137,6 +137,57 @@ impl KeychainSigner {
             .map_err(|error| SignerError::Certificate(error.to_string()))
     }
 
+    pub fn development_certificate_chain(
+        ca_label: &str,
+        leaf_label: &str,
+        issuer_uri: &str,
+    ) -> Result<Vec<Vec<u8>>, SignerError> {
+        let ca_signer = Self::find_or_create(ca_label)?;
+        let ca_key_pair = KeyPair::from_remote(Box::new(KeychainRemote {
+            public_key: ca_signer.public_key.clone(),
+            signer: ca_signer,
+        }))
+        .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Advatar development attestation CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca_params.serial_number = Some(SerialNumber::from_slice(
+            &Sha256::digest(ca_label.as_bytes())[..16],
+        ));
+        let ca = ca_params
+            .self_signed(&ca_key_pair)
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+
+        let leaf_signer = Self::find_or_create(leaf_label)?;
+        let leaf_key_pair = KeyPair::from_remote(Box::new(KeychainRemote {
+            public_key: leaf_signer.public_key.clone(),
+            signer: leaf_signer,
+        }))
+        .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "TLSNotary evidence development signer");
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.subject_alt_names = vec![SanType::URI(
+            Ia5String::try_from(issuer_uri)
+                .map_err(|error| SignerError::Certificate(error.to_string()))?,
+        )];
+        leaf_params.serial_number = Some(SerialNumber::from_slice(
+            &Sha256::digest(format!("{leaf_label}:{issuer_uri}").as_bytes())[..16],
+        ));
+        let leaf = leaf_params
+            .signed_by(&leaf_key_pair, &ca, &ca_key_pair)
+            .map_err(|error| SignerError::Certificate(error.to_string()))?;
+        Ok(vec![leaf.der().to_vec(), ca.der().to_vec()])
+    }
+
     fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
         self.key
             .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
@@ -224,5 +275,20 @@ mod tests {
             &Signature::from_slice(&signature).expect("raw signature"),
         )
         .expect("signature verifies");
+    }
+
+    #[test]
+    #[ignore = "creates and accesses persistent macOS Keychain keys"]
+    fn creates_a_distinct_development_leaf_and_ca() {
+        let chain = KeychainSigner::development_certificate_chain(
+            "dev.advatar.vcissuer.test-ca",
+            "dev.advatar.vcissuer.test-leaf",
+            "https://issuer.example",
+        )
+        .expect("certificate chain");
+        assert_eq!(chain.len(), 2);
+        assert!(!chain[0].is_empty());
+        assert!(!chain[1].is_empty());
+        assert_ne!(chain[0], chain[1]);
     }
 }
