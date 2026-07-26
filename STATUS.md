@@ -41,6 +41,7 @@
 ## Development credential-signing certificate path
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/9
-- [ ] Create a development attestation CA and exact-issuer TLSNotary signing leaf.
-- [ ] Publish and advertise the bounded leaf/root path without reusing the HTTPS identity.
-- [ ] Test key/profile binding, pass tests/clippy, merge, and delete the branch.
+- [x] Create a development attestation CA and exact-issuer TLSNotary signing leaf.
+- [x] Publish and advertise the bounded leaf/root path without reusing the HTTPS identity.
+- [x] Test key/profile binding and pass tests/clippy.
+- [ ] Merge, verify `origin/main`, and delete the branch.
