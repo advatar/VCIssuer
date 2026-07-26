@@ -49,5 +49,6 @@
 ## Mandatory PAR discovery metadata
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/11
-- [ ] Advertise the PAR requirement in authorization-server metadata.
-- [ ] Add a regression test, pass tests/clippy, merge, verify `origin/main`, and delete the branch.
+- [x] Advertise the PAR requirement in authorization-server metadata.
+- [x] Add a regression test and pass tests/clippy.
+- [ ] Merge, verify `origin/main`, and delete the branch.

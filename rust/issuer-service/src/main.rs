@@ -579,7 +579,11 @@ fn mdoc_profile(configuration_id: &str, doc_type: &str, name: &str) -> Value {
 
 async fn oauth_metadata(State(state): State<AppState>) -> Json<Value> {
     let issuer = state.issuer.as_str().trim_end_matches('/');
-    Json(json!({
+    Json(oauth_metadata_value(issuer))
+}
+
+fn oauth_metadata_value(issuer: &str) -> Value {
+    json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}/authorize"),
         "token_endpoint": format!("{issuer}/token"),
@@ -587,9 +591,10 @@ async fn oauth_metadata(State(state): State<AppState>) -> Json<Value> {
         "jwks_uri": format!("{issuer}/jwks.json"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
+        "require_pushed_authorization_requests": true,
         "code_challenge_methods_supported": ["S256"],
         "dpop_signing_alg_values_supported": ["ES256"]
-    }))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2375,6 +2380,16 @@ mod tests {
         assert_eq!(
             profile["credential_signing_certificate_endpoint"],
             "https://issuer.example/credential-signing-certificates/dev.advatar.tlsn.evidence.sd-jwt"
+        );
+    }
+
+    #[test]
+    fn authorization_server_metadata_advertises_mandatory_par() {
+        let metadata = oauth_metadata_value("https://issuer.example");
+        assert_eq!(metadata["require_pushed_authorization_requests"], true);
+        assert_eq!(
+            metadata["pushed_authorization_request_endpoint"],
+            "https://issuer.example/par"
         );
     }
 
