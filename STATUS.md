@@ -28,4 +28,4 @@
 - [x] Reject missing, empty, multiple, unknown, and legacy ambiguous proof shapes.
 - [x] Preserve nonce, audience, holder-key, and DPoP binding validation.
 - [x] Add successful and adversarial endpoint tests and pass formatting, tests, and clippy.
-- [ ] Commit, push, merge to `main`, and delete the implementation branch.
+- [x] Commit, push, merge to `main`, and delete the implementation branch.
