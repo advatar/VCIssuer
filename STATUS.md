@@ -29,3 +29,10 @@
 - [x] Preserve nonce, audience, holder-key, and DPoP binding validation.
 - [x] Add successful and adversarial endpoint tests and pass formatting, tests, and clippy.
 - [x] Commit, push, merge to `main`, and delete the implementation branch.
+
+## Wallet-compatible credential nonce encoding
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/7
+- [ ] Emit a cryptographically random non-zero `u64` as canonical decimal `c_nonce` text.
+- [ ] Preserve exact nonce proof binding and one-use replay rejection.
+- [ ] Add focused tests, pass formatting/tests/clippy, merge, and delete the branch.
