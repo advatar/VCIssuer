@@ -67,4 +67,5 @@
 - [x] Require atomic classical and post-quantum protection with downgrade rejection.
 - [x] Add local adversarial, isolation, and regression tests.
 - [ ] Consume and pass the shared EUWallet interoperability vectors when published.
-- [ ] Merge, verify `origin/main`, and delete the implementation branch.
+- [x] Merge the initial implementation and verify it is reachable from `origin/main`.
+- [ ] Pin the shared vectors, merge the final interoperability update, and delete the issue branch.
