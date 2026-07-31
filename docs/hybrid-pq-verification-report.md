@@ -27,8 +27,23 @@ CBOR, size bounds, mandatory experimental framing, and standard-profile
 isolation.
 
 This proves TBS compatibility with the currently published EUWallet vectors.
-The complete shared envelope plus ES256/ML-DSA signature-vector corpus remains
-blocked on EUWallet issue #83 and is not claimed here.
+The issuer also matches the standalone public-key and atomic dual-signature
+container bytes frozen by EUWallet PR #103, including their strict 8 KiB,
+canonical-CBOR, closed-field, exact-component, and downgrade-rejection rules.
+
+The shared component corpus adds one canonical issuer-wrapper TBS, real P-256
+and ML-DSA-65 public keys, real signatures produced by VCIssuer's `p256` and
+libcrux backends, both frozen component envelopes, and twelve deterministic
+rejection mutations. EUWallet independently verifies the ES256 signature with
+AWS-LC and the ML-DSA-65 signature with RustCrypto `ml-dsa`, then consumes the
+same mutation instructions. Fixed seeds and randomness are public test fixtures
+and are never production key material.
+
+PR #103 does not define the credential wrapper that carries the canonical
+payload, disclosures, key identifiers, generation, and issuance context. The
+complete shared credential-wrapper plus real ES256/ML-DSA signature/mutation
+corpus remains gated by EUWallet issues #87, #88, #90, and #91 and is not
+claimed here.
 
 ## Tier 2 — Lean 4 semantic proofs
 
@@ -75,11 +90,11 @@ side-channel resistance, primitive conformance, or external certification.
 
 The Rust evidence is supplied by `hybrid_codec`, `hybrid_signer`, and
 `pq_backend` unit tests plus the full workspace test/clippy/build gates. The
-workspace and local serial Keychain integration runs pass 30 tests in total
+workspace and local serial Keychain integration runs pass 33 tests in total
 (with no ignored test left unexecuted across the two local runs). Interactive
 Keychain tests are not run in the headless Actions session, where macOS denies
 Security.framework UI access; CI instead retains the deployed Keychain signer
-smoke check. The hybrid-specific gate passes all six codec tests. The
+smoke check. The hybrid-specific gate passes all nine codec/vector tests. The
 dependency decision, SBOM delta, RustSec result, key-wrapping design, and
 remaining qualification gates are recorded in
 `docs/hybrid-pq-dependency-evidence.md`.

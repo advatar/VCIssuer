@@ -19,6 +19,7 @@ const DOMAIN: &[u8] = b"EUWALLET-HYBRID-SIGNATURE-V1";
 const CONTEXT_DOMAIN: &[u8] = b"EUWALLET-HYBRID-CONTEXT-V1";
 const ENVELOPE_MAGIC: &[u8] = b"EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0";
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+const MAX_COMPONENT_ENVELOPE_BYTES: usize = 8 * 1024;
 const MAX_FIELD_BYTES: usize = 4_096;
 const MIN_NONCE_BYTES: usize = 16;
 const MAX_NONCE_BYTES: usize = 64;
@@ -85,6 +86,12 @@ pub struct UnsignedEnvelope {
 }
 
 pub struct EnvelopeSignatures {
+    pub classical: Vec<u8>,
+    pub post_quantum: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HybridPublicComponents {
     pub classical: Vec<u8>,
     pub post_quantum: Vec<u8>,
 }
@@ -230,6 +237,98 @@ pub fn build_tbs(
     Ok(output)
 }
 
+/// Encode the standalone public-key container frozen by `EUWallet` PR #103.
+pub fn encode_public_key_envelope(
+    classical: &[u8],
+    post_quantum: &[u8],
+) -> Result<Vec<u8>, HybridCodecError> {
+    if classical.len() != 65
+        || classical.first().copied() != Some(0x04)
+        || post_quantum.len() != pq_backend::PUBLIC_KEY_BYTES
+    {
+        return Err(HybridCodecError::Malformed);
+    }
+    encode_component_envelope(vec![
+        pair(1, Value::Integer(Integer::from(VERSION))),
+        pair(2, Value::Integer(Integer::from(1))),
+        pair(3, Value::Text(PROFILE.into())),
+        pair(4, Value::Bytes(classical.to_vec())),
+        pair(5, Value::Bytes(post_quantum.to_vec())),
+    ])
+}
+
+#[allow(dead_code)]
+pub fn decode_public_key_envelope(
+    encoded: &[u8],
+) -> Result<HybridPublicComponents, HybridCodecError> {
+    let fields = decode_component_envelope(encoded, 5)?;
+    if integer(&fields[0].1)? != VERSION
+        || integer(&fields[1].1)? != 1
+        || text(&fields[2].1)? != PROFILE
+    {
+        return Err(HybridCodecError::Unsupported);
+    }
+    let classical = bytes(&fields[3].1)?.to_vec();
+    let post_quantum = bytes(&fields[4].1)?.to_vec();
+    if classical.len() != 65
+        || classical.first().copied() != Some(0x04)
+        || post_quantum.len() != pq_backend::PUBLIC_KEY_BYTES
+    {
+        return Err(HybridCodecError::Malformed);
+    }
+    Ok(HybridPublicComponents {
+        classical,
+        post_quantum,
+    })
+}
+
+/// Encode the standalone atomic dual-signature container frozen by `EUWallet` PR #103.
+#[allow(dead_code)]
+pub fn encode_signature_envelope(
+    purpose: HybridPurpose,
+    signatures: &EnvelopeSignatures,
+) -> Result<Vec<u8>, HybridCodecError> {
+    if signatures.classical.len() != 64
+        || signatures.post_quantum.len() != pq_backend::SIGNATURE_BYTES
+    {
+        return Err(HybridCodecError::Missing);
+    }
+    encode_component_envelope(vec![
+        pair(1, Value::Integer(Integer::from(VERSION))),
+        pair(2, Value::Integer(Integer::from(2))),
+        pair(3, Value::Text(PROFILE.into())),
+        pair(4, Value::Bytes(signatures.classical.clone())),
+        pair(5, Value::Bytes(signatures.post_quantum.clone())),
+        pair(6, Value::Text(purpose.id().into())),
+    ])
+}
+
+#[allow(dead_code)]
+pub fn decode_signature_envelope(
+    encoded: &[u8],
+    expected_purpose: HybridPurpose,
+) -> Result<EnvelopeSignatures, HybridCodecError> {
+    let fields = decode_component_envelope(encoded, 6)?;
+    let purpose = HybridPurpose::try_from(text(&fields[5].1)?)?;
+    if integer(&fields[0].1)? != VERSION
+        || integer(&fields[1].1)? != 2
+        || text(&fields[2].1)? != PROFILE
+        || purpose != expected_purpose
+    {
+        return Err(HybridCodecError::Unsupported);
+    }
+    let signatures = EnvelopeSignatures {
+        classical: bytes(&fields[3].1)?.to_vec(),
+        post_quantum: bytes(&fields[4].1)?.to_vec(),
+    };
+    if signatures.classical.len() != 64
+        || signatures.post_quantum.len() != pq_backend::SIGNATURE_BYTES
+    {
+        return Err(HybridCodecError::Missing);
+    }
+    Ok(signatures)
+}
+
 pub fn encode(
     unsigned: &UnsignedEnvelope,
     signatures: &EnvelopeSignatures,
@@ -368,6 +467,57 @@ fn decode(
     ))
 }
 
+fn encode_component_envelope(fields: Vec<(Value, Value)>) -> Result<Vec<u8>, HybridCodecError> {
+    let mut encoded = ENVELOPE_MAGIC.to_vec();
+    ciborium::ser::into_writer(&Value::Map(fields), &mut encoded)
+        .map_err(|_| HybridCodecError::Malformed)?;
+    if encoded.len() > MAX_COMPONENT_ENVELOPE_BYTES {
+        return Err(HybridCodecError::Oversized);
+    }
+    Ok(encoded)
+}
+
+fn decode_component_envelope(
+    encoded: &[u8],
+    expected_fields: usize,
+) -> Result<Vec<(u64, Value)>, HybridCodecError> {
+    if encoded.len() > MAX_COMPONENT_ENVELOPE_BYTES {
+        return Err(HybridCodecError::Oversized);
+    }
+    let body = encoded
+        .strip_prefix(ENVELOPE_MAGIC)
+        .ok_or(HybridCodecError::Malformed)?;
+    let mut cursor = Cursor::new(body);
+    let value: Value =
+        ciborium::de::from_reader(&mut cursor).map_err(|_| HybridCodecError::Malformed)?;
+    if usize::try_from(cursor.position()).ok() != Some(body.len()) {
+        return Err(HybridCodecError::NonCanonical);
+    }
+    let mut canonical = Vec::new();
+    ciborium::ser::into_writer(&value, &mut canonical).map_err(|_| HybridCodecError::Malformed)?;
+    if canonical != body {
+        return Err(HybridCodecError::NonCanonical);
+    }
+    let Value::Map(entries) = value else {
+        return Err(HybridCodecError::Malformed);
+    };
+    if entries.len() != expected_fields {
+        return Err(HybridCodecError::Missing);
+    }
+    let mut fields = Vec::with_capacity(entries.len());
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        let Value::Integer(key) = key else {
+            return Err(HybridCodecError::Malformed);
+        };
+        let key = u64::try_from(key).map_err(|_| HybridCodecError::Malformed)?;
+        if key != u64::try_from(index + 1).map_err(|_| HybridCodecError::Malformed)? {
+            return Err(HybridCodecError::DuplicateField);
+        }
+        fields.push((key, value));
+    }
+    Ok(fields)
+}
+
 fn append_component(output: &mut Vec<u8>, component: &[u8]) -> Result<(), HybridCodecError> {
     let length = u32::try_from(component.len()).map_err(|_| HybridCodecError::LengthOverflow)?;
     output.extend_from_slice(&length.to_be_bytes());
@@ -475,10 +625,15 @@ fn byte_array(value: &Value) -> Result<Vec<Vec<u8>>, HybridCodecError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
+    use libcrux_ml_dsa::ml_dsa_65::{generate_key_pair, sign};
     use p256::ecdsa::{
         SigningKey,
         signature::{Signer, Verifier},
     };
+    use serde_json::json;
+    use zeroize::Zeroize;
 
     use super::*;
 
@@ -517,6 +672,68 @@ mod tests {
             expires_at_epoch_seconds: 1_700_003_600,
             transcript_hash: None,
         }
+    }
+
+    fn vector_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/vectors")
+            .join(name)
+    }
+
+    fn assert_or_update_vector(name: &str, contents: &str) {
+        let path = vector_path(name);
+        if std::env::var_os("UPDATE_HYBRID_PQ_VECTORS").is_some() {
+            fs::write(&path, format!("{contents}\n")).expect("write generated vector");
+        }
+        assert_eq!(
+            fs::read_to_string(path)
+                .expect("shared vector exists")
+                .trim(),
+            contents
+        );
+    }
+
+    fn apply_vector_operations(mut bytes: Vec<u8>, operations: &[serde_json::Value]) -> Vec<u8> {
+        fn usize_field(operation: &serde_json::Value, field: &str) -> usize {
+            usize::try_from(operation[field].as_u64().expect("unsigned mutation field"))
+                .expect("mutation field fits usize")
+        }
+
+        for operation in operations {
+            let kind = operation["op"].as_str().expect("mutation operation");
+            match kind {
+                "xor" => {
+                    let offset = usize_field(operation, "offset");
+                    bytes[offset] ^=
+                        u8::try_from(operation["value"].as_u64().expect("unsigned xor value"))
+                            .expect("xor value fits u8");
+                }
+                "truncate" => {
+                    let count = usize_field(operation, "count");
+                    bytes.truncate(bytes.len() - count);
+                }
+                "append" => bytes.extend_from_slice(
+                    &hex::decode(operation["hex"].as_str().expect("append hex"))
+                        .expect("valid append hex"),
+                ),
+                "replace" => {
+                    let offset = usize_field(operation, "offset");
+                    let delete = usize_field(operation, "delete");
+                    bytes.splice(
+                        offset..offset + delete,
+                        hex::decode(operation["hex"].as_str().expect("replace hex"))
+                            .expect("valid replace hex"),
+                    );
+                }
+                "remove" => {
+                    let offset = usize_field(operation, "offset");
+                    let count = usize_field(operation, "count");
+                    bytes.drain(offset..offset + count);
+                }
+                _ => panic!("unknown mutation operation"),
+            }
+        }
+        bytes
     }
 
     fn fixture() -> Fixture {
@@ -791,5 +1008,237 @@ mod tests {
             build_tbs(HybridPurpose::TestSdJwtWrapperV1, &context, b"payload"),
             Err(HybridCodecError::GenerationMismatch)
         );
+    }
+
+    #[test]
+    fn matches_euwallet_pr103_component_envelope_bytes() {
+        let mut classical_key = vec![0x11; 65];
+        classical_key[0] = 0x04;
+        let pq_key = vec![0x22; pq_backend::PUBLIC_KEY_BYTES];
+        let encoded_key =
+            encode_public_key_envelope(&classical_key, &pq_key).expect("public-key envelope");
+        let mut expected_key = ENVELOPE_MAGIC.to_vec();
+        expected_key.extend_from_slice(&[0xa5, 0x01, 0x01, 0x02, 0x01, 0x03, 0x75]);
+        expected_key.extend_from_slice(PROFILE.as_bytes());
+        expected_key.extend_from_slice(&[0x04, 0x58, 0x41]);
+        expected_key.extend_from_slice(&classical_key);
+        expected_key.extend_from_slice(&[0x05, 0x59, 0x07, 0xa0]);
+        expected_key.extend_from_slice(&pq_key);
+        assert_eq!(encoded_key, expected_key);
+        assert_eq!(
+            decode_public_key_envelope(&encoded_key),
+            Ok(HybridPublicComponents {
+                classical: classical_key,
+                post_quantum: pq_key,
+            })
+        );
+
+        let signatures = EnvelopeSignatures {
+            classical: vec![0x33; 64],
+            post_quantum: vec![0x44; pq_backend::SIGNATURE_BYTES],
+        };
+        let encoded_signature =
+            encode_signature_envelope(HybridPurpose::TestSdJwtWrapperV1, &signatures)
+                .expect("signature envelope");
+        let mut expected_signature = ENVELOPE_MAGIC.to_vec();
+        expected_signature.extend_from_slice(&[0xa6, 0x01, 0x01, 0x02, 0x02, 0x03, 0x75]);
+        expected_signature.extend_from_slice(PROFILE.as_bytes());
+        expected_signature.extend_from_slice(&[0x04, 0x58, 0x40]);
+        expected_signature.extend_from_slice(&signatures.classical);
+        expected_signature.extend_from_slice(&[0x05, 0x59, 0x0c, 0xed]);
+        expected_signature.extend_from_slice(&signatures.post_quantum);
+        expected_signature.extend_from_slice(&[0x06, 0x76]);
+        expected_signature.extend_from_slice(HybridPurpose::TestSdJwtWrapperV1.id().as_bytes());
+        assert_eq!(encoded_signature, expected_signature);
+        let decoded =
+            decode_signature_envelope(&encoded_signature, HybridPurpose::TestSdJwtWrapperV1)
+                .expect("signature envelope round trip");
+        assert_eq!(decoded.classical, signatures.classical);
+        assert_eq!(decoded.post_quantum, signatures.post_quantum);
+    }
+
+    #[test]
+    fn euwallet_component_envelopes_reject_noncanonical_and_downgraded_input() {
+        let mut classical_key = vec![0x11; 65];
+        classical_key[0] = 0x04;
+        let pq_key = vec![0x22; pq_backend::PUBLIC_KEY_BYTES];
+        let encoded =
+            encode_public_key_envelope(&classical_key, &pq_key).expect("public-key envelope");
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_public_key_envelope(&trailing),
+            Err(HybridCodecError::NonCanonical)
+        );
+
+        let mut wrong_kind = encoded.clone();
+        wrong_kind[ENVELOPE_MAGIC.len() + 4] = 2;
+        assert_eq!(
+            decode_public_key_envelope(&wrong_kind),
+            Err(HybridCodecError::Unsupported)
+        );
+
+        let signatures = EnvelopeSignatures {
+            classical: vec![0x33; 64],
+            post_quantum: vec![0x44; pq_backend::SIGNATURE_BYTES],
+        };
+        let mut signature =
+            encode_signature_envelope(HybridPurpose::TestSdJwtWrapperV1, &signatures)
+                .expect("signature envelope");
+        signature.truncate(signature.len() - HybridPurpose::TestSdJwtWrapperV1.id().len() - 2);
+        assert!(decode_signature_envelope(&signature, HybridPurpose::TestSdJwtWrapperV1).is_err());
+
+        assert!(matches!(
+            decode_public_key_envelope(&vec![0; MAX_COMPONENT_ENVELOPE_BYTES + 1]),
+            Err(HybridCodecError::Oversized)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn consumes_deterministic_real_signature_component_corpus() {
+        let classical_key =
+            SigningKey::from_bytes((&[7_u8; 32]).into()).expect("fixed vector P-256 key");
+        let mut pq_key_pair = generate_key_pair([0x42; 32]);
+        let unsigned = UnsignedEnvelope {
+            purpose: HybridPurpose::TestSdJwtWrapperV1,
+            context: issuer_context(9),
+            payload: b"shared experimental credential payload".to_vec(),
+            disclosures: vec![
+                b"shared disclosure one".to_vec(),
+                b"shared disclosure two".to_vec(),
+            ],
+            classical_kid: "shared-classical-kid-v1".into(),
+            pq_kid: "shared-pq-kid-v1".into(),
+            generation: 9,
+        };
+        let signed = tbs(&unsigned).expect("shared vector TBS");
+        let classical_signature: Signature = classical_key.sign(&signed);
+        let pq_signature = sign(&pq_key_pair.signing_key, &signed, &[], [0x24; 32])
+            .expect("fixed-randomness ML-DSA vector")
+            .as_slice()
+            .to_vec();
+        let classical_public_key = classical_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let pq_public_key = pq_key_pair.verification_key.as_slice().to_vec();
+        let public_key_envelope = encode_public_key_envelope(&classical_public_key, &pq_public_key)
+            .expect("shared public-key envelope");
+        let signature_envelope = encode_signature_envelope(
+            unsigned.purpose,
+            &EnvelopeSignatures {
+                classical: classical_signature.to_bytes().to_vec(),
+                post_quantum: pq_signature,
+            },
+        )
+        .expect("shared signature envelope");
+        pq_key_pair.signing_key.as_mut_slice().zeroize();
+
+        assert_or_update_vector("hybrid-pq-v1-component-tbs.hex", &hex::encode(&signed));
+        assert_or_update_vector(
+            "hybrid-pq-v1-public-key-envelope.hex",
+            &hex::encode(&public_key_envelope),
+        );
+        assert_or_update_vector(
+            "hybrid-pq-v1-signature-envelope.hex",
+            &hex::encode(&signature_envelope),
+        );
+
+        let profile_offset = signature_envelope
+            .windows(PROFILE.len())
+            .position(|window| window == PROFILE.as_bytes())
+            .expect("profile offset");
+        let classical_signature_offset = profile_offset + PROFILE.len() + 3;
+        let pq_signature_offset = classical_signature_offset + 64 + 4;
+        let purpose_offset = pq_signature_offset + pq_backend::SIGNATURE_BYTES + 2;
+        let mutations = json!({
+            "version": 1,
+            "profile": PROFILE,
+            "purpose": unsigned.purpose.id(),
+            "provenance": {
+                "p256_private_scalar_hex": hex::encode([7_u8; 32]),
+                "ml_dsa_65_keygen_seed_hex": hex::encode([0x42_u8; 32]),
+                "ml_dsa_65_signing_randomness_hex": hex::encode([0x24_u8; 32]),
+                "test_only": true
+            },
+            "mutations": [
+                {"name":"bad-prefix", "target":"public-key-envelope", "operations":[{"op":"xor", "offset":0, "value":1}]},
+                {"name":"unsupported-version", "target":"public-key-envelope", "operations":[{"op":"xor", "offset":ENVELOPE_MAGIC.len() + 2, "value":3}]},
+                {"name":"unsupported-kind", "target":"public-key-envelope", "operations":[{"op":"xor", "offset":ENVELOPE_MAGIC.len() + 4, "value":3}]},
+                {"name":"unknown-profile", "target":"signature-envelope", "operations":[{"op":"xor", "offset":profile_offset + PROFILE.len() - 1, "value":3}]},
+                {"name":"invalid-classical-signature", "target":"signature-envelope", "operations":[{"op":"xor", "offset":classical_signature_offset, "value":1}]},
+                {"name":"invalid-pq-signature", "target":"signature-envelope", "operations":[{"op":"xor", "offset":pq_signature_offset, "value":1}]},
+                {"name":"unknown-purpose", "target":"signature-envelope", "operations":[{"op":"xor", "offset":purpose_offset + unsigned.purpose.id().len() - 1, "value":3}]},
+                {"name":"truncated", "target":"signature-envelope", "operations":[{"op":"truncate", "count":1}]},
+                {"name":"trailing-cbor", "target":"signature-envelope", "operations":[{"op":"append", "hex":"00"}]},
+                {"name":"noncanonical-version", "target":"public-key-envelope", "operations":[{"op":"replace", "offset":ENVELOPE_MAGIC.len() + 1, "delete":1, "hex":"1801"}]},
+                {"name":"missing-classical-component", "target":"signature-envelope", "operations":[
+                    {"op":"xor", "offset":ENVELOPE_MAGIC.len(), "value":3},
+                    {"op":"remove", "offset":classical_signature_offset - 3, "count":67}
+                ]},
+                {"name":"missing-pq-component", "target":"signature-envelope", "operations":[
+                    {"op":"xor", "offset":ENVELOPE_MAGIC.len(), "value":3},
+                    {"op":"remove", "offset":pq_signature_offset - 4, "count":pq_backend::SIGNATURE_BYTES + 4}
+                ]}
+            ]
+        });
+        assert_or_update_vector(
+            "hybrid-pq-v1-component-mutations.json",
+            &serde_json::to_string_pretty(&mutations).expect("mutation JSON"),
+        );
+
+        let consumed_mutations: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(vector_path("hybrid-pq-v1-component-mutations.json"))
+                .expect("shared mutation corpus"),
+        )
+        .expect("valid shared mutation JSON");
+        for mutation in consumed_mutations["mutations"]
+            .as_array()
+            .expect("mutation list")
+        {
+            let target = mutation["target"].as_str().expect("mutation target");
+            let base = match target {
+                "public-key-envelope" => public_key_envelope.clone(),
+                "signature-envelope" => signature_envelope.clone(),
+                _ => panic!("unknown mutation target"),
+            };
+            let mutated = apply_vector_operations(
+                base,
+                mutation["operations"].as_array().expect("operations"),
+            );
+            if target == "public-key-envelope" {
+                assert!(
+                    decode_public_key_envelope(&mutated).is_err(),
+                    "{} must reject",
+                    mutation["name"]
+                );
+                continue;
+            }
+            match decode_signature_envelope(&mutated, unsigned.purpose) {
+                Err(_) => {}
+                Ok(decoded) => {
+                    let classical = Signature::from_slice(&decoded.classical)
+                        .expect("fixed-size classical mutation");
+                    let classical_valid = classical_key
+                        .verifying_key()
+                        .verify(&signed, &classical)
+                        .is_ok();
+                    let pq_valid = pq_backend::verify_signature(
+                        &pq_public_key,
+                        &signed,
+                        &decoded.post_quantum,
+                    )
+                    .is_ok();
+                    assert!(
+                        !(classical_valid && pq_valid),
+                        "{} must reject",
+                        mutation["name"]
+                    );
+                }
+            }
+        }
     }
 }
