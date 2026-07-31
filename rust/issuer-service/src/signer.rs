@@ -95,6 +95,10 @@ impl KeychainSigner {
         &self.kid
     }
 
+    pub fn public_key_bytes(&self) -> &[u8] {
+        &self.public_key
+    }
+
     pub fn public_jwk(&self) -> Value {
         json!({
             "kty": "EC",
