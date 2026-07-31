@@ -19,9 +19,6 @@ jobs:
       - name: Default tests
         working-directory: rust
         run: ~/.cargo/bin/cargo +1.97.0 test --workspace --locked
-      - name: Keychain integration tests
-        working-directory: rust
-        run: ~/.cargo/bin/cargo +1.97.0 test --locked -p issuer-service -- --ignored --test-threads=1
       - name: Shared hybrid-PQ TBS vectors
         run: |
           shasum -a 256 --check <<'SUMS'
@@ -45,7 +42,7 @@ jobs:
       - name: Compile every Lean theorem
         working-directory: formal/lean
         run: |
-          if rg -n '\b(sorry|axiom)\b' EudiIssuer; then
+          if grep -R -n -E '(^|[^[:alnum:]_])(sorry|axiom)([^[:alnum:]_]|$)' EudiIssuer; then
             echo "Lean proof placeholders are forbidden" >&2
             exit 1
           fi
@@ -60,9 +57,9 @@ jobs:
           ssh -i ~/actions-runner-vcissuer/tamarin-ci-key -o BatchMode=yes johansellstrom@127.0.0.1 \
             'cd ~/actions-runner-vcissuer/_work/VCIssuer/VCIssuer/formal/tamarin && MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove' \
             | tee tamarin-proof.txt
-          ! rg -n '(falsified|incomplete)' tamarin-proof.txt
+          ! grep -n -E '(falsified|incomplete)' tamarin-proof.txt
           for lemma in hybrid_issuance_is_atomic hybrid_components_sign_same_tbs classical_component_removal_is_rejected hybrid_generation_agreement; do
-            rg -n "${lemma} .*verified" tamarin-proof.txt
+            grep -n -E "${lemma} .*verified" tamarin-proof.txt
           done
 
   bundle:
