@@ -42,8 +42,8 @@ and are never production key material.
 PR #103 does not define the credential wrapper that carries the canonical
 payload, disclosures, key identifiers, generation, and issuance context. The
 complete shared credential-wrapper plus real ES256/ML-DSA signature/mutation
-corpus remains gated by EUWallet issues #87, #88, #90, and #91 and is not
-claimed here.
+corpus remains gated by EUWallet issues #90 and #91 and is not claimed here.
+Atomic wallet signing and verification prerequisites #87 and #88 are complete.
 
 ## Tier 2 — Lean 4 semantic proofs
 

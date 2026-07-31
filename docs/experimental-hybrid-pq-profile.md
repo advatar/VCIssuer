@@ -58,9 +58,10 @@ The shared component corpus contains real signatures over one common TBS and
 twelve structural mutations; VCIssuer and EUWallet consume identical files and
 verify with independent ES256 and ML-DSA-65 implementations.
 
-The credential wrapper below remains provisional pending EUWallet issues #87,
-#88, #90, and #91, which cover atomic wallet signing and verification,
-credential-wrapper integration, and the complete adversarial corpus. It begins
+The credential wrapper below remains provisional pending EUWallet issues #90
+and #91, which cover credential-wrapper integration and the complete
+adversarial corpus. Atomic wallet signing and verification prerequisites #87
+and #88 are complete. The wrapper begins
 with the mandatory magic bytes
 `EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0`, followed by canonical CBOR integer map
 labels:

@@ -60,8 +60,8 @@
   ML-DSA-65, and configuration `dev.advatar.hybrid-pq.sd-jwt.v1`.
 - [ ] Jointly freeze with EUWallet the credential-wrapper canonical-CBOR schema and shared
   payload/disclosure/context plus real-key/signature adversarial corpus; replace or pin the
-  provisional issuer wrapper before claiming interoperability (EUWallet #85, #87, #88, #90,
-  and #91).
+  provisional issuer wrapper before claiming interoperability (EUWallet #90 and #91; backend and
+  atomic wallet sign/verify prerequisites #85, #87, and #88 are complete).
 - [x] Complete the initial ML-DSA dependency review, key-custody design, SBOM delta, and
   evidence record; retain external audit, KAT, and shared-vector gates.
 - [x] Add disabled-by-default experimental issuance without changing certified EUDI paths.
