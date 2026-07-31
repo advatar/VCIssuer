@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod hybrid_codec;
+#[cfg(target_os = "macos")]
+mod hybrid_signer;
+mod pq_backend;
 #[cfg(target_os = "macos")]
 mod signer;
 mod svipe;
@@ -46,6 +50,8 @@ use url::Url;
 use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
+use hybrid_signer::HybridCredentialSigner;
+#[cfg(target_os = "macos")]
 use signer::KeychainSigner;
 
 const PID_SD_JWT: &str = "eu.europa.ec.eudi.pid_vc_sd_jwt.de";
@@ -58,6 +64,7 @@ const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
 const DEV_SVIPE_PID_SD_JWT: &str = svipe::PROFILE;
 const TLSN_EVIDENCE_SD_JWT: &str = "dev.advatar.tlsn.evidence.sd-jwt";
 const TLSN_EVIDENCE_VCT: &str = "dev.advatar.tlsn.evidence.1";
+const HYBRID_PQ_SD_JWT: &str = "dev.advatar.hybrid-pq.sd-jwt.v1";
 const TLSN_ARTIFACT_VERSION: &str = "tlsn.notary-artifact.v1";
 const MAX_TLSN_ARTIFACT_BYTES: usize = 256 * 1024;
 const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
@@ -66,11 +73,14 @@ const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
 struct AppState {
     issuer: Url,
     trusted_notary_key: Vec<u8>,
+    hybrid_pq_enabled: bool,
     inner: Arc<Mutex<VolatileState>>,
     #[cfg(target_os = "macos")]
     metadata_signer: Arc<KeychainSigner>,
     #[cfg(target_os = "macos")]
     credential_signers: Arc<HashMap<&'static str, KeychainSigner>>,
+    #[cfg(target_os = "macos")]
+    hybrid_credential_signer: Option<Arc<HybridCredentialSigner>>,
     #[cfg(target_os = "macos")]
     development_signing_chains: Arc<HashMap<&'static str, Vec<Vec<u8>>>>,
 }
@@ -297,6 +307,8 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
         .expect("LISTEN_ADDR must be a socket address");
+    let hybrid_pq_enabled = std::env::var("ENABLE_EXPERIMENTAL_HYBRID_PQ")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 
     #[cfg(target_os = "macos")]
     let credential_signers = [
@@ -329,9 +341,18 @@ async fn main() {
         .expect("TLSNotary development signing certificate chain must be available"),
     )]);
 
+    #[cfg(target_os = "macos")]
+    let hybrid_credential_signer = hybrid_pq_enabled.then(|| {
+        Arc::new(
+            HybridCredentialSigner::find_or_create("dev.advatar.vcissuer.hybrid-pq.es256.v1")
+                .expect("experimental hybrid credential signer must be available"),
+        )
+    });
+
     let app = app(AppState {
         issuer,
         trusted_notary_key,
+        hybrid_pq_enabled,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
         metadata_signer: Arc::new(
@@ -340,6 +361,8 @@ async fn main() {
         ),
         #[cfg(target_os = "macos")]
         credential_signers: Arc::new(credential_signers),
+        #[cfg(target_os = "macos")]
+        hybrid_credential_signer,
         #[cfg(target_os = "macos")]
         development_signing_chains: Arc::new(development_signing_chains),
     });
@@ -385,6 +408,10 @@ fn app(state: AppState) -> Router {
             get(oauth_metadata),
         )
         .route("/jwks.json", get(jwks))
+        .route(
+            "/experimental/hybrid-pq/profile",
+            get(hybrid_pq_profile_document),
+        )
         .route(
             "/credential-signing-certificates/{configuration_id}",
             get(credential_signing_certificates),
@@ -474,7 +501,7 @@ async fn issuer_metadata(
 fn issuer_metadata_value(state: &AppState) -> Value {
     let issuer = state.issuer.as_str().trim_end_matches('/');
     let tlsn_profile = tlsn_metadata_profile(issuer);
-    json!({
+    let mut metadata = json!({
         "credential_issuer": issuer,
         "authorization_servers": [issuer],
         "credential_endpoint": format!("{issuer}/credential"),
@@ -489,6 +516,33 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)"),
             TLSN_EVIDENCE_SD_JWT: tlsn_profile
         }
+    });
+    if state.hybrid_pq_enabled {
+        metadata["credential_configurations_supported"]
+            .as_object_mut()
+            .expect("credential configurations are an object")
+            .insert(HYBRID_PQ_SD_JWT.into(), hybrid_metadata_profile(issuer));
+    }
+    metadata
+}
+
+fn hybrid_metadata_profile(issuer: &str) -> Value {
+    json!({
+        "format": hybrid_codec::FORMAT,
+        "scope": HYBRID_PQ_SD_JWT,
+        "vct": "dev.advatar.hybrid-pq.credential.v1",
+        "cryptographic_binding_methods_supported": ["jwk"],
+        "proof_types_supported": {
+            "jwt": {"proof_signing_alg_values_supported": ["ES256"]}
+        },
+        "experimental_profile": hybrid_codec::PROFILE,
+        "experimental_profile_document": format!("{issuer}/experimental/hybrid-pq/profile"),
+        "development_only": true,
+        "eudi_conformant": false,
+        "display": [{
+            "name": "Experimental hybrid-PQ credential (non-EUDI)",
+            "locale": "en"
+        }]
     })
 }
 
@@ -614,6 +668,44 @@ async fn jwks() -> Json<Value> {
     Json(json!({"keys": []}))
 }
 
+#[cfg(target_os = "macos")]
+async fn hybrid_pq_profile_document(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, StatusCode> {
+    let signer = state
+        .hybrid_credential_signer
+        .as_ref()
+        .filter(|_| state.hybrid_pq_enabled)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({
+        "version": hybrid_codec::VERSION,
+        "profile": hybrid_codec::PROFILE,
+        "purpose": hybrid_codec::PURPOSE,
+        "credential_format": hybrid_codec::FORMAT,
+        "configuration_id": HYBRID_PQ_SD_JWT,
+        "acceptance_rule": "ES256 valid AND ML-DSA-65 valid",
+        "logical_key_generation": signer.generation(),
+        "classical": {
+            "algorithm": "ES256",
+            "kid": signer.classical_kid(),
+            "public_key_sec1": URL_SAFE_NO_PAD.encode(signer.classical_public_key())
+        },
+        "post_quantum": {
+            "algorithm": "ML-DSA-65",
+            "kid": signer.pq_kid(),
+            "public_key": URL_SAFE_NO_PAD.encode(signer.pq_public_key())
+        },
+        "development_only": true,
+        "eudi_conformant": false,
+        "shared_vectors_status": "pending"
+    })))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn hybrid_pq_profile_document() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
 async fn par(
     State(state): State<AppState>,
     Form(request): Form<ParRequest>,
@@ -625,7 +717,7 @@ async fn par(
             "response_type=code and PKCE S256 are required",
         ));
     }
-    if !valid_scope(&request.scope) {
+    if !valid_scope(&request.scope, state.hybrid_pq_enabled) {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_scope",
@@ -690,8 +782,10 @@ async fn create_credential_offer(
             "TLSNotary evidence offers require verified evidence",
         ));
     }
-    if !valid_scope(&request.credential_configuration_id)
-        || request.credential_configuration_id.contains(' ')
+    if !valid_scope(
+        &request.credential_configuration_id,
+        state.hybrid_pq_enabled,
+    ) || request.credential_configuration_id.contains(' ')
     {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
@@ -1109,6 +1203,42 @@ async fn credential(
                 "this development build requires macOS Keychain",
             ))
         }
+        HYBRID_PQ_SD_JWT => {
+            #[cfg(target_os = "macos")]
+            {
+                let signer = state
+                    .hybrid_credential_signer
+                    .as_ref()
+                    .filter(|_| state.hybrid_pq_enabled)
+                    .ok_or_else(|| {
+                        oauth_error(
+                            StatusCode::FORBIDDEN,
+                            "credential_request_denied",
+                            "experimental hybrid-PQ issuance is disabled",
+                        )
+                    })?;
+                let credential = issue_hybrid_credential(
+                    signer,
+                    &state.issuer,
+                    &verified_proof.holder_jwk,
+                    &verified_proof.holder_jkt,
+                    &verified_proof.nonce,
+                    now,
+                )?;
+                Ok(Json(json!({
+                    "credentials": [{
+                        "credential": URL_SAFE_NO_PAD.encode(credential),
+                        "format": hybrid_codec::FORMAT
+                    }]
+                })))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(oauth_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "credential_request_denied",
+                "experimental hybrid-PQ issuance requires macOS Keychain",
+            ))
+        }
         PID_MDOC | EAA_MDOC => {
             #[cfg(target_os = "macos")]
             {
@@ -1139,7 +1269,7 @@ async fn credential(
     }
 }
 
-fn valid_scope(scope: &str) -> bool {
+fn valid_scope(scope: &str, hybrid_pq_enabled: bool) -> bool {
     let allowed = [
         PID_SD_JWT,
         PID_MDOC,
@@ -1152,7 +1282,7 @@ fn valid_scope(scope: &str) -> bool {
     let mut count = 0;
     for item in scope.split_ascii_whitespace() {
         count += 1;
-        if !allowed.contains(&item) {
+        if !(allowed.contains(&item) || hybrid_pq_enabled && item == HYBRID_PQ_SD_JWT) {
             return false;
         }
     }
@@ -1716,7 +1846,7 @@ fn authorize_kernel(
         PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
-        TLSN_EVIDENCE_SD_JWT => IssuerRole::DevelopmentEvidence,
+        TLSN_EVIDENCE_SD_JWT | HYBRID_PQ_SD_JWT => IssuerRole::DevelopmentEvidence,
         _ => {
             return Err(oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -1730,7 +1860,8 @@ fn authorize_kernel(
         | QEAA_SD_JWT
         | QEAA_PID_BOUND_SD_JWT
         | DEV_SVIPE_PID_SD_JWT
-        | TLSN_EVIDENCE_SD_JWT => CredentialFormat::SdJwtVc,
+        | TLSN_EVIDENCE_SD_JWT
+        | HYBRID_PQ_SD_JWT => CredentialFormat::SdJwtVc,
         PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
@@ -1823,6 +1954,104 @@ fn authorize_kernel(
 fn hash_u128(value: &str) -> u128 {
     let digest = Sha256::digest(value.as_bytes());
     u128::from_be_bytes(digest[..16].try_into().expect("slice length is fixed"))
+}
+
+#[cfg(target_os = "macos")]
+fn issue_hybrid_credential(
+    signer: &HybridCredentialSigner,
+    issuer: &Url,
+    holder_jwk: &Value,
+    holder_jkt: &str,
+    nonce: &str,
+    now: u64,
+) -> Result<Vec<u8>, (StatusCode, Json<OAuthError>)> {
+    let claims = [
+        ("credential_name", json!("Experimental hybrid credential")),
+        ("assurance", json!("development-only-non-eudi")),
+        ("issuing_country", json!("DE")),
+    ];
+    let mut disclosures = Vec::with_capacity(claims.len());
+    let mut disclosure_hashes = Vec::with_capacity(claims.len());
+    for (name, value) in claims {
+        let disclosure = CborValue::Array(vec![
+            CborValue::Text(random_token()),
+            CborValue::Text(name.into()),
+            CborValue::Bytes(
+                serde_json::to_vec(&value).expect("development claim is serializable"),
+            ),
+        ]);
+        let disclosure = encode_canonical_cbor(&disclosure)?;
+        disclosure_hashes.push(CborValue::Bytes(Sha256::digest(&disclosure).to_vec()));
+        disclosures.push(disclosure);
+    }
+    let payload = encode_canonical_cbor(&CborValue::Map(vec![
+        cbor_pair(
+            1,
+            CborValue::Text(issuer.as_str().trim_end_matches('/').into()),
+        ),
+        cbor_pair(2, CborValue::Integer(now.into())),
+        cbor_pair(3, CborValue::Integer(now.saturating_add(3600).into())),
+        cbor_pair(
+            4,
+            CborValue::Text("dev.advatar.hybrid-pq.credential.v1".into()),
+        ),
+        cbor_pair(
+            5,
+            CborValue::Bytes(
+                serde_json::to_vec(holder_jwk).expect("verified holder JWK is serializable"),
+            ),
+        ),
+        cbor_pair(6, CborValue::Array(disclosure_hashes)),
+        cbor_pair(7, CborValue::Bool(true)),
+    ]))?;
+    let context = encode_canonical_cbor(&CborValue::Map(vec![
+        cbor_pair(
+            1,
+            CborValue::Text(issuer.as_str().trim_end_matches('/').into()),
+        ),
+        cbor_pair(
+            2,
+            CborValue::Text(issuer.as_str().trim_end_matches('/').into()),
+        ),
+        cbor_pair(3, CborValue::Text(nonce.into())),
+        cbor_pair(4, CborValue::Text(holder_jkt.into())),
+        cbor_pair(5, CborValue::Integer(signer.generation().into())),
+        cbor_pair(6, CborValue::Integer(now.into())),
+    ]))?;
+    let unsigned = hybrid_codec::UnsignedEnvelope {
+        context,
+        payload,
+        disclosures,
+        classical_kid: signer.classical_kid().into(),
+        pq_kid: signer.pq_kid().into(),
+        generation: signer.generation(),
+    };
+    signer.sign_envelope(&unsigned).map_err(|error| {
+        tracing::error!(%error, "experimental hybrid credential signing failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "experimental hybrid credential signing is unavailable",
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn encode_canonical_cbor(value: &CborValue) -> Result<Vec<u8>, (StatusCode, Json<OAuthError>)> {
+    let mut encoded = Vec::new();
+    ciborium::ser::into_writer(&value, &mut encoded).map_err(|_| {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "experimental hybrid credential encoding failed",
+        )
+    })?;
+    Ok(encoded)
+}
+
+#[cfg(target_os = "macos")]
+fn cbor_pair(key: u64, value: CborValue) -> (CborValue, CborValue) {
+    (CborValue::Integer(key.into()), value)
 }
 
 #[cfg(target_os = "macos")]
@@ -2367,10 +2596,12 @@ mod tests {
 
     #[test]
     fn scope_is_closed() {
-        assert!(valid_scope(PID_SD_JWT));
-        assert!(valid_scope(TLSN_EVIDENCE_SD_JWT));
-        assert!(!valid_scope("openid unknown"));
-        assert!(!valid_scope(""));
+        assert!(valid_scope(PID_SD_JWT, false));
+        assert!(valid_scope(TLSN_EVIDENCE_SD_JWT, false));
+        assert!(!valid_scope(HYBRID_PQ_SD_JWT, false));
+        assert!(valid_scope(HYBRID_PQ_SD_JWT, true));
+        assert!(!valid_scope("openid unknown", true));
+        assert!(!valid_scope("", true));
     }
 
     #[test]
@@ -2380,6 +2611,24 @@ mod tests {
         assert_eq!(
             profile["credential_signing_certificate_endpoint"],
             "https://issuer.example/credential-signing-certificates/dev.advatar.tlsn.evidence.sd-jwt"
+        );
+    }
+
+    #[test]
+    fn hybrid_metadata_is_private_experimental_and_does_not_advertise_mldsa_as_standard() {
+        let profile = hybrid_metadata_profile("https://issuer.example");
+        assert_eq!(profile["format"], hybrid_codec::FORMAT);
+        assert_eq!(profile["experimental_profile"], hybrid_codec::PROFILE);
+        assert_eq!(profile["development_only"], true);
+        assert_eq!(profile["eudi_conformant"], false);
+        assert!(
+            profile
+                .get("credential_signing_alg_values_supported")
+                .is_none()
+        );
+        assert_eq!(
+            profile["proof_types_supported"]["jwt"]["proof_signing_alg_values_supported"],
+            json!(["ES256"])
         );
     }
 

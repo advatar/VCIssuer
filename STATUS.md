@@ -56,10 +56,15 @@
 ## Experimental hybrid post-quantum issuance
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/13
-- [ ] Wait for the `euwallet-hybrid-pq-v1` profile, threat model, canonical envelope,
-  common signed bytes, reviewed KEM combiner, dependency selection, and interoperability
-  vectors to be completed and merged in EUWallet.
-- [ ] Add disabled-by-default experimental issuance without changing certified EUDI paths.
-- [ ] Require atomic classical and post-quantum protection with downgrade rejection.
-- [ ] Add cross-repository interoperability, adversarial, isolation, and regression tests.
+- [x] Pin the high-level experimental profile to `euwallet-hybrid-pq-v1`, ES256 AND
+  ML-DSA-65, and configuration `dev.advatar.hybrid-pq.sd-jwt.v1`.
+- [ ] Jointly freeze with EUWallet the byte-level canonical-CBOR schema, TBS length encoding,
+  canonical context, field bounds, and shared positive/adversarial vectors; replace or pin the
+  provisional issuer codec before claiming interoperability.
+- [x] Complete the initial ML-DSA dependency review, key-custody design, SBOM delta, and
+  evidence record; retain external audit, KAT, and shared-vector gates.
+- [x] Add disabled-by-default experimental issuance without changing certified EUDI paths.
+- [x] Require atomic classical and post-quantum protection with downgrade rejection.
+- [x] Add local adversarial, isolation, and regression tests.
+- [ ] Consume and pass the shared EUWallet interoperability vectors when published.
 - [ ] Merge, verify `origin/main`, and delete the implementation branch.

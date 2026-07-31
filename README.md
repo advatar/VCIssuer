@@ -22,6 +22,13 @@ RUST_LOG=issuer_service=info \
 cargo run -p issuer-service
 ```
 
+The private hybrid post-quantum experiment is disabled by default. Set
+`ENABLE_EXPERIMENTAL_HYBRID_PQ=true` to expose only the separately named
+`dev.advatar.hybrid-pq.sd-jwt.v1` configuration. It is a canonical-CBOR
+ES256-and-ML-DSA-65 development envelope, not SD-JWT VC, mdoc, or an EUDI
+credential. See
+[`docs/experimental-hybrid-pq-profile.md`](docs/experimental-hybrid-pq-profile.md).
+
 Run the issuance portal in another terminal:
 
 ```sh
