@@ -1,0 +1,154 @@
+{
+  "mutations": [
+    {
+      "name": "bad-prefix",
+      "operations": [
+        {
+          "offset": 0,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "public-key-envelope"
+    },
+    {
+      "name": "unsupported-version",
+      "operations": [
+        {
+          "offset": 37,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "public-key-envelope"
+    },
+    {
+      "name": "unsupported-kind",
+      "operations": [
+        {
+          "offset": 39,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "public-key-envelope"
+    },
+    {
+      "name": "unknown-profile",
+      "operations": [
+        {
+          "offset": 62,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "invalid-classical-signature",
+      "operations": [
+        {
+          "offset": 66,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "invalid-pq-signature",
+      "operations": [
+        {
+          "offset": 134,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "unknown-purpose",
+      "operations": [
+        {
+          "offset": 3466,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "truncated",
+      "operations": [
+        {
+          "count": 1,
+          "op": "truncate"
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "trailing-cbor",
+      "operations": [
+        {
+          "hex": "00",
+          "op": "append"
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "noncanonical-version",
+      "operations": [
+        {
+          "delete": 1,
+          "hex": "1801",
+          "offset": 36,
+          "op": "replace"
+        }
+      ],
+      "target": "public-key-envelope"
+    },
+    {
+      "name": "missing-classical-component",
+      "operations": [
+        {
+          "offset": 35,
+          "op": "xor",
+          "value": 3
+        },
+        {
+          "count": 67,
+          "offset": 63,
+          "op": "remove"
+        }
+      ],
+      "target": "signature-envelope"
+    },
+    {
+      "name": "missing-pq-component",
+      "operations": [
+        {
+          "offset": 35,
+          "op": "xor",
+          "value": 3
+        },
+        {
+          "count": 3313,
+          "offset": 130,
+          "op": "remove"
+        }
+      ],
+      "target": "signature-envelope"
+    }
+  ],
+  "profile": "euwallet-hybrid-pq-v1",
+  "provenance": {
+    "ml_dsa_65_keygen_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "ml_dsa_65_signing_randomness_hex": "2424242424242424242424242424242424242424242424242424242424242424",
+    "p256_private_scalar_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "test_only": true
+  },
+  "purpose": "test-sd-jwt-wrapper-v1",
+  "version": 1
+}

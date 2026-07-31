@@ -677,6 +677,11 @@ async fn hybrid_pq_profile_document(
         .as_ref()
         .filter(|_| state.hybrid_pq_enabled)
         .ok_or(StatusCode::NOT_FOUND)?;
+    let public_key_envelope = hybrid_codec::encode_public_key_envelope(
+        signer.classical_public_key(),
+        signer.pq_public_key(),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({
         "version": hybrid_codec::VERSION,
         "profile": hybrid_codec::PROFILE,
@@ -695,9 +700,12 @@ async fn hybrid_pq_profile_document(
             "kid": signer.pq_kid(),
             "public_key": URL_SAFE_NO_PAD.encode(signer.pq_public_key())
         },
+        "public_key_envelope": URL_SAFE_NO_PAD.encode(public_key_envelope),
+        "component_envelope_schema": "euwallet-pr103-frozen",
+        "credential_wrapper_schema": "provisional-pending-euwallet-90-91",
         "development_only": true,
         "eudi_conformant": false,
-        "shared_vectors_status": "tbs-vectors-pass-envelope-signature-vectors-pending",
+        "shared_vectors_status": "tbs-vectors-pass-component-schema-frozen-credential-vectors-pending",
         "verification_report": "docs/hybrid-pq-verification-report.md"
     })))
 }

@@ -48,9 +48,21 @@ The TBS is:
 Both ES256 and ML-DSA-65 sign these exact bytes. Rust tests and CI checksum
 gates consume all three shared TBS vectors.
 
-The current private envelope remains provisional pending the shared envelope,
-public-key, signature, encoded-envelope, and adversarial vectors tracked by
-EUWallet issue #83. It begins with the mandatory magic bytes
+EUWallet PR #103 has separately frozen strict standalone public-key and atomic
+dual-signature containers. The issuer implements both byte-for-byte schemas and
+publishes the encoded public-key container as `public_key_envelope` on the
+experimental profile endpoint. Those component containers use an 8 KiB total
+limit, exact key/signature sizes, closed ascending integer keys, and reject
+noncanonical, missing, unknown, reordered, trailing, or downgraded inputs.
+The shared component corpus contains real signatures over one common TBS and
+twelve structural mutations; VCIssuer and EUWallet consume identical files and
+verify with independent ES256 and ML-DSA-65 implementations.
+
+The credential wrapper below remains provisional pending EUWallet issues #90
+and #91, which cover credential-wrapper integration and the complete
+adversarial corpus. Atomic wallet signing and verification prerequisites #87
+and #88 are complete. The wrapper begins
+with the mandatory magic bytes
 `EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0`, followed by canonical CBOR integer map
 labels:
 
@@ -72,7 +84,8 @@ The signed payload component is canonical CBOR containing labels `1`
 (credential payload bytes) and `2` (disclosure byte strings), so disclosure
 mutation is signed and fails closed.
 
-The issuer and EUWallet must jointly pin this envelope by consuming the same
-positive and mutation vectors before envelope interoperability is claimed. The
-current formal and executable evidence is documented in
+The issuer and EUWallet must jointly pin this credential wrapper by consuming
+the same payload/disclosure/context plus real-key/signature positive and
+mutation vectors before credential interoperability is claimed. The current
+formal and executable evidence is documented in
 `docs/hybrid-pq-verification-report.md`.
