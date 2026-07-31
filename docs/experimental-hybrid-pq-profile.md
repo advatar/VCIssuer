@@ -23,16 +23,42 @@ plaintext secret buffer exists only for a signing operation and is zeroized
 before return. If the P-256 identity changes, a new ML-DSA key is generated and
 the logical generation advances.
 
-## Provisional envelope checkpoint
+## Frozen TBS contract and provisional envelope
 
-The current codec is intentionally private and provisional pending the shared
-EUWallet vectors. It uses canonical CBOR integer map labels:
+The issuer consumes the exact `HybridContextV1` and `HybridTBSV1` contract and
+three TBS vectors merged by EUWallet PR #100. The purpose is
+`test-sd-jwt-wrapper-v1`. Context bytes start with
+`EUWALLET-HYBRID-CONTEXT-V1`; tagged fields use a one-byte tag followed by an
+unsigned 32-bit big-endian length and value. The context binds wallet identity,
+optional issuer identity, logical key generation, optional transaction/session
+and audience values, a 16–64 byte nonce, creation and expiry times, and an
+optional 32-byte transcript hash. Purpose-specific required and forbidden fields
+fail closed.
+
+The TBS is:
+
+```text
+"EUWALLET-HYBRID-SIGNATURE-V1"
+|| u32be(length(profile)) || profile
+|| u32be(length(purpose)) || purpose
+|| u32be(length(context)) || context
+|| u32be(length(payload)) || payload
+```
+
+Both ES256 and ML-DSA-65 sign these exact bytes. Rust tests and CI checksum
+gates consume all three shared TBS vectors.
+
+The current private envelope remains provisional pending the shared envelope,
+public-key, signature, encoded-envelope, and adversarial vectors tracked by
+EUWallet issue #83. It begins with the mandatory magic bytes
+`EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0`, followed by canonical CBOR integer map
+labels:
 
 | Label | Field | Type |
 |---:|---|---|
 | 1 | version | unsigned integer (`1`) |
 | 2 | profile | text (`euwallet-hybrid-pq-v1`) |
-| 3 | purpose | text (`experimental-sd-jwt-wrapper`) |
+| 3 | purpose | text (`test-sd-jwt-wrapper-v1`) |
 | 4 | credential format | text (`dev-hybrid-pq+cbor`) |
 | 5 | canonical credential payload | byte string |
 | 6 | disclosures | array of byte strings |
@@ -42,12 +68,11 @@ EUWallet vectors. It uses canonical CBOR integer map labels:
 | 10 | ES256 signature | 64-byte byte string |
 | 11 | ML-DSA-65 signature | 3309-byte byte string |
 
-TBS lengths are unsigned 32-bit big-endian integers. The `payload` TBS
-component is canonical CBOR containing labels `1` (credential payload bytes)
-and `2` (disclosure byte strings), so disclosure mutation is signed and fails
-closed. The context is canonical CBOR binding issuer, audience, nonce, holder
-key thumbprint, logical generation, and issue time.
+The signed payload component is canonical CBOR containing labels `1`
+(credential payload bytes) and `2` (disclosure byte strings), so disclosure
+mutation is signed and fails closed.
 
-The issuer and EUWallet must replace or formally pin this checkpoint by
-consuming the same shared positive and mutation vectors before interoperability
-is claimed.
+The issuer and EUWallet must jointly pin this envelope by consuming the same
+positive and mutation vectors before envelope interoperability is claimed. The
+current formal and executable evidence is documented in
+`docs/hybrid-pq-verification-report.md`.

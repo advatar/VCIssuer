@@ -697,7 +697,8 @@ async fn hybrid_pq_profile_document(
         },
         "development_only": true,
         "eudi_conformant": false,
-        "shared_vectors_status": "pending"
+        "shared_vectors_status": "tbs-vectors-pass-envelope-signature-vectors-pending",
+        "verification_report": "docs/hybrid-pq-verification-report.md"
     })))
 }
 
@@ -2004,21 +2005,21 @@ fn issue_hybrid_credential(
         cbor_pair(6, CborValue::Array(disclosure_hashes)),
         cbor_pair(7, CborValue::Bool(true)),
     ]))?;
-    let context = encode_canonical_cbor(&CborValue::Map(vec![
-        cbor_pair(
-            1,
-            CborValue::Text(issuer.as_str().trim_end_matches('/').into()),
-        ),
-        cbor_pair(
-            2,
-            CborValue::Text(issuer.as_str().trim_end_matches('/').into()),
-        ),
-        cbor_pair(3, CborValue::Text(nonce.into())),
-        cbor_pair(4, CborValue::Text(holder_jkt.into())),
-        cbor_pair(5, CborValue::Integer(signer.generation().into())),
-        cbor_pair(6, CborValue::Integer(now.into())),
-    ]))?;
+    let issuer_identity = issuer.as_str().trim_end_matches('/').as_bytes().to_vec();
+    let context = hybrid_codec::HybridContext {
+        wallet_identity: holder_jkt.as_bytes().to_vec(),
+        issuer_identity: Some(issuer_identity.clone()),
+        key_generation: signer.generation(),
+        transaction_id: Some(nonce.as_bytes().to_vec()),
+        session_id: None,
+        audience: Some(issuer_identity),
+        nonce: Sha256::digest(nonce.as_bytes()).to_vec(),
+        created_at_epoch_seconds: now,
+        expires_at_epoch_seconds: now.saturating_add(3600),
+        transcript_hash: None,
+    };
     let unsigned = hybrid_codec::UnsignedEnvelope {
+        purpose: hybrid_codec::HybridPurpose::TestSdJwtWrapperV1,
         context,
         payload,
         disclosures,

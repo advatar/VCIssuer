@@ -66,6 +66,13 @@
 - [x] Add disabled-by-default experimental issuance without changing certified EUDI paths.
 - [x] Require atomic classical and post-quantum protection with downgrade rejection.
 - [x] Add local adversarial, isolation, and regression tests.
-- [ ] Consume and pass the shared EUWallet interoperability vectors when published.
+- [x] Align `HybridContextV1` and `HybridTBSV1` with the contract and three TBS vectors merged by
+  EUWallet PR #100; retain the envelope/signature-vector gate from EUWallet issue #83.
+- [x] Extend Lean with machine-checked hybrid AND-acceptance, same-TBS, generation-binding, and
+  downgrade-rejection theorems, with zero `sorry` placeholders.
+- [x] Extend Tamarin with atomic hybrid issuance, same-message agreement, component-removal
+  downgrade rejection, and logical-generation agreement lemmas.
+- [x] Add a reproducible formal-evidence report and publish its precisely scoped results on the
+  issuer landing page.
 - [x] Merge the initial implementation and verify it is reachable from `origin/main`.
 - [ ] Pin the shared vectors, merge the final interoperability update, and delete the issue branch.
