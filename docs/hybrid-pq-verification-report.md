@@ -75,9 +75,11 @@ side-channel resistance, primitive conformance, or external certification.
 
 The Rust evidence is supplied by `hybrid_codec`, `hybrid_signer`, and
 `pq_backend` unit tests plus the full workspace test/clippy/build gates. The
-workspace and serial Keychain integration runs pass 30 tests in total (with no
-ignored test left unexecuted across the two runs). The hybrid-specific gate
-passes all six codec tests. The
+workspace and local serial Keychain integration runs pass 30 tests in total
+(with no ignored test left unexecuted across the two local runs). Interactive
+Keychain tests are not run in the headless Actions session, where macOS denies
+Security.framework UI access; CI instead retains the deployed Keychain signer
+smoke check. The hybrid-specific gate passes all six codec tests. The
 dependency decision, SBOM delta, RustSec result, key-wrapping design, and
 remaining qualification gates are recorded in
 `docs/hybrid-pq-dependency-evidence.md`.
