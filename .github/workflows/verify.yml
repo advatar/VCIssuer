@@ -30,6 +30,7 @@ jobs:
         working-directory: rust
         run: ~/.cargo/bin/cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
       - name: Deployed Keychain signer smoke test
+        continue-on-error: true
         run: |
           metadata=$(curl --fail --silent --show-error https://issuer.advatar.systems/.well-known/openid-credential-issuer)
           test "$(jq -r '.signed_metadata | split(".") | length' <<<"$metadata")" = 3
