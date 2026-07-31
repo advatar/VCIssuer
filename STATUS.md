@@ -52,3 +52,14 @@
 - [x] Advertise the PAR requirement in authorization-server metadata.
 - [x] Add a regression test and pass tests/clippy.
 - [x] Merge, verify `origin/main`, and delete the branch.
+
+## Experimental hybrid post-quantum issuance
+
+- [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/13
+- [ ] Wait for the `euwallet-hybrid-pq-v1` profile, threat model, canonical envelope,
+  common signed bytes, reviewed KEM combiner, dependency selection, and interoperability
+  vectors to be completed and merged in EUWallet.
+- [ ] Add disabled-by-default experimental issuance without changing certified EUDI paths.
+- [ ] Require atomic classical and post-quantum protection with downgrade rejection.
+- [ ] Add cross-repository interoperability, adversarial, isolation, and regression tests.
+- [ ] Merge, verify `origin/main`, and delete the implementation branch.
