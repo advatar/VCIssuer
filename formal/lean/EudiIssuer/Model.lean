@@ -243,4 +243,128 @@ theorem authorizeSign_respects_wallet_maintenance_bound
     ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hBound, _⟩
   exact hBound
 
+/-! ## Experimental hybrid post-quantum issuance boundary
+
+The cryptographic algorithms remain abstract: this model proves the issuer's
+closed AND-policy, identical-TBS binding, logical-generation agreement, and
+downgrade rejection. It does not prove ES256 or ML-DSA arithmetic.
+-/
+
+abbrev HybridTbsId := Nat
+abbrev HybridKeyGeneration := Nat
+
+structure HybridVerification where
+  profileSupported : Bool
+  hybridRequired : Bool
+  classicalPresent : Bool
+  postQuantumPresent : Bool
+  classicalValid : Bool
+  postQuantumValid : Bool
+  classicalTbs : HybridTbsId
+  postQuantumTbs : HybridTbsId
+  expectedTbs : HybridTbsId
+  classicalGeneration : HybridKeyGeneration
+  postQuantumGeneration : HybridKeyGeneration
+  expectedGeneration : HybridKeyGeneration
+  deriving DecidableEq, Repr
+
+/-- The only experimental hybrid acceptance predicate: every conjunct is mandatory. -/
+def hybridAccept (v : HybridVerification) : Prop :=
+  v.profileSupported = true ∧
+  v.hybridRequired = true ∧
+  v.classicalPresent = true ∧
+  v.postQuantumPresent = true ∧
+  v.classicalValid = true ∧
+  v.postQuantumValid = true ∧
+  v.classicalTbs = v.expectedTbs ∧
+  v.postQuantumTbs = v.expectedTbs ∧
+  v.classicalGeneration = v.expectedGeneration ∧
+  v.postQuantumGeneration = v.expectedGeneration ∧
+  0 < v.expectedGeneration
+
+noncomputable instance hybridAcceptDecidable (v : HybridVerification) :
+    Decidable (hybridAccept v) := Classical.propDecidable _
+
+structure HybridSignCommand where
+  authorized : SignCommand
+  tbs : HybridTbsId
+  generation : HybridKeyGeneration
+  deriving DecidableEq, Repr
+
+/-- Hybrid signing is reachable only after both ordinary authorization and hybrid AND-policy. -/
+noncomputable def authorizeHybridSign
+    (s : Session) (r : Request) (now : Instant) (v : HybridVerification) :
+    Except Error HybridSignCommand :=
+  match authorizeSign s r now with
+  | .error error => .error error
+  | .ok command =>
+      if _h : hybridAccept v then
+        .ok { authorized := command, tbs := v.expectedTbs, generation := v.expectedGeneration }
+      else
+        .error .notAuthorized
+
+/-- A hybrid command proves both the ordinary issuer gate and the hybrid AND-policy. -/
+theorem authorizeHybridSign_sound
+    (s : Session) (r : Request) (now : Instant) (v : HybridVerification)
+    (cmd : HybridSignCommand) (h : authorizeHybridSign s r now v = .ok cmd) :
+    mayIssue s r now ∧ hybridAccept v := by
+  unfold authorizeHybridSign at h
+  cases hSign : authorizeSign s r now with
+  | error error => simp [hSign] at h
+  | ok command =>
+      simp [hSign] at h
+      split at h
+      next hHybrid =>
+        exact ⟨authorizeSign_sound s r now command hSign, hHybrid⟩
+      next _ => simp_all
+
+/-- Acceptance requires both signature components to be present and valid. -/
+theorem hybrid_accept_requires_both_components (v : HybridVerification)
+    (h : hybridAccept v) :
+    v.classicalPresent = true ∧ v.postQuantumPresent = true ∧
+    v.classicalValid = true ∧ v.postQuantumValid = true := by
+  rcases h with ⟨_, _, hCp, hPqp, hCv, hPqv, _⟩
+  exact ⟨hCp, hPqp, hCv, hPqv⟩
+
+/-- Both algorithms authorize the exact same expected TBS identifier. -/
+theorem hybrid_accept_same_tbs (v : HybridVerification) (h : hybridAccept v) :
+    v.classicalTbs = v.postQuantumTbs ∧ v.classicalTbs = v.expectedTbs := by
+  rcases h with ⟨_, _, _, _, _, _, hClassical, hPq, _⟩
+  exact ⟨hClassical.trans hPq.symm, hClassical⟩
+
+/-- Both component keys belong to one non-zero logical generation. -/
+theorem hybrid_accept_generation_agreement (v : HybridVerification) (h : hybridAccept v) :
+    v.classicalGeneration = v.postQuantumGeneration ∧
+    v.classicalGeneration = v.expectedGeneration ∧ 0 < v.expectedGeneration := by
+  rcases h with ⟨_, _, _, _, _, _, _, _, hClassical, hPq, hPositive⟩
+  exact ⟨hClassical.trans hPq.symm, hClassical, hPositive⟩
+
+/-- Removing the PQ component is a downgrade and cannot satisfy hybrid acceptance. -/
+theorem classical_only_cannot_hybrid_accept (v : HybridVerification)
+    (hMissing : v.postQuantumPresent = false) : ¬ hybridAccept v := by
+  intro h
+  have hPresent := (hybrid_accept_requires_both_components v h).2.1
+  simp [hMissing] at hPresent
+
+/-- Removing the classical component cannot turn the profile into PQ-only acceptance. -/
+theorem post_quantum_only_cannot_hybrid_accept (v : HybridVerification)
+    (hMissing : v.classicalPresent = false) : ¬ hybridAccept v := by
+  intro h
+  have hPresent := (hybrid_accept_requires_both_components v h).1
+  simp [hMissing] at hPresent
+
+/-- Hybrid-required policy cannot be silently negotiated down to classical mode. -/
+theorem classical_downgrade_cannot_hybrid_accept (v : HybridVerification)
+    (hDowngraded : v.hybridRequired = false) : ¬ hybridAccept v := by
+  intro h
+  have hRequired := h.2.1
+  simp [hDowngraded] at hRequired
+
+/-- An unsupported profile is rejected before component validity can matter. -/
+theorem unsupported_profile_cannot_hybrid_accept (v : HybridVerification)
+    (hUnsupported : v.profileSupported = false) : ¬ hybridAccept v := by
+  intro h
+  have hSupported := h.1
+  simp [hUnsupported] at hSupported
+
 end EudiIssuer

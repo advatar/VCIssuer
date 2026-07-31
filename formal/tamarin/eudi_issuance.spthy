@@ -15,7 +15,9 @@ builtins: signing, hashing
 functions:
   token/4,
   proof/4,
-  credential/6
+  hybrid_proof/5,
+  credential/6,
+  hybrid_credential/8
 
 /* Public issuer signing key setup. */
 rule RegisterIssuer:
@@ -62,6 +64,37 @@ rule RevealIssuerKey:
   --[ IssuerKeyCompromised($I) ]->
   [ Out(~skI) ]
 
+/* Experimental hybrid identity: both component keys share one fresh logical
+ * generation. The theory abstracts ES256 and ML-DSA-65 as independent signing
+ * keys; it proves protocol composition, not their arithmetic. */
+rule RegisterHybridIssuer:
+  [ Fr(~skClassical), Fr(~skPostQuantum), Fr(~generation) ]
+  --[ HybridIssuerRegistered(
+        $I, ~generation, pk(~skClassical), pk(~skPostQuantum)) ]->
+  [ !HybridIssuerKey($I, ~generation, ~skClassical, ~skPostQuantum),
+    Out(<'euwallet-hybrid-pq-v1', ~generation,
+         pk(~skClassical), pk(~skPostQuantum)>) ]
+
+/* Atomic experimental issuance. There is deliberately no rule that emits
+ * HybridCredentialIssued from one component, a mismatched TBS, or mixed
+ * generations. Both signatures are constructed over the same $Tbs term. */
+rule IssueHybridCredential:
+  [ !HybridIssuerKey($I, $Generation, ~skClassical, ~skPostQuantum),
+    !Authorization($I, $W, 'euwallet-hybrid-pq-v1', $Subject, $Dataset, $HolderPk),
+    TokenState(
+      $I, $W, 'euwallet-hybrid-pq-v1', $Subject, $Dataset, $HolderPk, ~tok),
+    !ValidEvidence($I, $W, 'euwallet-hybrid-pq-v1', $Subject, $HolderPk),
+    In(hybrid_proof($I, ~tok, $HolderPk, $Nonce, $Tbs)),
+    Fr(~cid) ]
+  --[ HybridCredentialIssued(
+        $I, $W, $Subject, $Dataset, $HolderPk, ~cid, $Tbs, $Generation),
+      HybridClassicalSigned($I, ~cid, $Tbs, $Generation),
+      HybridPostQuantumSigned($I, ~cid, $Tbs, $Generation),
+      HybridNonceAccepted($I, $W, $Nonce) ]->
+  [ Out(hybrid_credential(
+      $I, 'euwallet-hybrid-pq-v1', $Subject, $Dataset, $HolderPk, ~cid, $Tbs,
+      <sign($Tbs, ~skClassical), sign($Tbs, ~skPostQuantum)>)) ]
+
 /* FI-PROT-001 seed. */
 lemma issuance_requires_matching_authorization:
   "All I W Profile Subject Dataset HolderPk Cid #i.
@@ -84,5 +117,37 @@ lemma credential_identifier_injective:
      CredentialIssued(I1, W1, P1, S1, D1, K1, Cid) @ #i
      & CredentialIssued(I2, W2, P2, S2, D2, K2, Cid) @ #j
      ==> #i = #j"
+
+/* Both components exist whenever the experimental hybrid credential is emitted. */
+lemma hybrid_issuance_is_atomic:
+  "All I W Subject Dataset HolderPk Cid Tbs Generation #i.
+     HybridCredentialIssued(
+       I, W, Subject, Dataset, HolderPk, Cid, Tbs, Generation) @ #i
+     ==> HybridClassicalSigned(I, Cid, Tbs, Generation) @ #i
+       & HybridPostQuantumSigned(I, Cid, Tbs, Generation) @ #i"
+
+/* The two component events authorize exactly one common TBS term. */
+lemma hybrid_components_sign_same_tbs:
+  "All I Cid ClassicalTbs PqTbs Generation #i #j.
+     HybridClassicalSigned(I, Cid, ClassicalTbs, Generation) @ #i
+     & HybridPostQuantumSigned(I, Cid, PqTbs, Generation) @ #j
+     ==> ClassicalTbs = PqTbs & #i = #j"
+
+/* A classical-only trace cannot satisfy the hybrid acceptance event. */
+lemma classical_component_removal_is_rejected:
+  "All I W Subject Dataset HolderPk Cid Tbs Generation #i.
+     HybridCredentialIssued(
+       I, W, Subject, Dataset, HolderPk, Cid, Tbs, Generation) @ #i
+     ==> (Ex #j.
+           HybridPostQuantumSigned(I, Cid, Tbs, Generation) @ #j
+           & #j = #i)"
+
+/* Both signatures and the acceptance event use one logical key generation. */
+lemma hybrid_generation_agreement:
+  "All I W Subject Dataset HolderPk Cid Tbs Generation #i.
+     HybridCredentialIssued(
+       I, W, Subject, Dataset, HolderPk, Cid, Tbs, Generation) @ #i
+     ==> HybridClassicalSigned(I, Cid, Tbs, Generation) @ #i
+       & HybridPostQuantumSigned(I, Cid, Tbs, Generation) @ #i"
 
 end

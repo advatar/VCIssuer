@@ -19,6 +19,16 @@ jobs:
       - name: Default tests
         working-directory: rust
         run: ~/.cargo/bin/cargo +1.97.0 test --workspace --locked
+      - name: Keychain integration tests
+        working-directory: rust
+        run: ~/.cargo/bin/cargo +1.97.0 test --locked -p issuer-service -- --ignored --test-threads=1
+      - name: Shared hybrid-PQ TBS vectors
+        run: |
+          shasum -a 256 --check <<'SUMS'
+          9470c29cb5745a726fe938b2837707f7500a2755a15c191f715460ba5cccc09f  rust/issuer-service/tests/vectors/hybrid-pq-v1-export-tbs.hex
+          9522edfe321def42c355e3357a7eabf4d8205df8e75dba619d1e6a0636db972e  rust/issuer-service/tests/vectors/hybrid-pq-v1-recovery-tbs.hex
+          816f9f5f3e8e62f48ce90a6a8762b0be3013c42a4b029ddaaad4a8ebef83ae03  rust/issuer-service/tests/vectors/hybrid-pq-v2-invalid-profile-tbs.hex
+          SUMS
       - name: Clippy
         working-directory: rust
         run: ~/.cargo/bin/cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
@@ -34,7 +44,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile every Lean theorem
         working-directory: formal/lean
-        run: ~/actions-runner-vcissuer/.elan-local/toolchains/leanprover--lean4---v4.32.0/bin/lake build
+        run: |
+          if rg -n '\b(sorry|axiom)\b' EudiIssuer; then
+            echo "Lean proof placeholders are forbidden" >&2
+            exit 1
+          fi
+          ~/actions-runner-vcissuer/.elan-local/toolchains/leanprover--lean4---v4.32.0/bin/lake build
 
   tamarin:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
@@ -43,7 +58,12 @@ jobs:
       - name: Prove all issuance lemmas
         run: |
           ssh -i ~/actions-runner-vcissuer/tamarin-ci-key -o BatchMode=yes johansellstrom@127.0.0.1 \
-            'cd ~/actions-runner-vcissuer/_work/VCIssuer/VCIssuer/formal/tamarin && MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove'
+            'cd ~/actions-runner-vcissuer/_work/VCIssuer/VCIssuer/formal/tamarin && MAUDE_LIB=~/actions-runner-vcissuer/tools/maude-share PATH=~/actions-runner-vcissuer/tools:/usr/bin:/bin ~/actions-runner-vcissuer/tools/tamarin-prover eudi_issuance.spthy --prove' \
+            | tee tamarin-proof.txt
+          ! rg -n '(falsified|incomplete)' tamarin-proof.txt
+          for lemma in hybrid_issuance_is_atomic hybrid_components_sign_same_tbs classical_component_removal_is_rejected hybrid_generation_agreement; do
+            rg -n "${lemma} .*verified" tamarin-proof.txt
+          done
 
   bundle:
     runs-on: [self-hosted, macOS, ARM64, vcissuer]
