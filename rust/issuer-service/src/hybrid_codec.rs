@@ -1,7 +1,7 @@
 //! Private `euwallet-hybrid-pq-v1` envelope, jointly frozen with `EUWallet`.
 //!
-//! The credential wrapper implements `HybridCredentialWrapperV1` (EUWallet
-//! issue #119); the component containers implement the EUWallet PR #103
+//! The credential wrapper implements `HybridCredentialWrapperV1` (`EUWallet`
+//! issue #119); the component containers implement the `EUWallet` PR #103
 //! schema. Both are pinned by shared cross-repository vectors.
 
 use std::{collections::BTreeSet, io::Cursor};
