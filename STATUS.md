@@ -1,5 +1,14 @@
 # Status
 
+## Restore issuer TLS service
+
+- [x] Create operations issue: https://github.com/advatar/VCIssuer/issues/19
+- [x] Identify the port-443 proxy conflict and preserve the existing SNI routes.
+- [x] Restore a valid TLS certificate and route issuer traffic to the Keychain signer.
+- [x] Verify signed issuer metadata and the expected five-key JWKS over public HTTPS.
+- [x] Make the deployed smoke probe blocking again.
+- [x] Merge, verify `origin/main`, close the issue, and delete the branch.
+
 ## PID-bound education credentials
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/2
