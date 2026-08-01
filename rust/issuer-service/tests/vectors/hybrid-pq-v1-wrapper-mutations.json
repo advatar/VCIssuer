@@ -12,7 +12,7 @@
     "key_generation": 9,
     "nonce_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "transaction_id_hex": "7472616e73616374696f6e2d313233",
-    "wallet_identity_hex": "77616c6c65742d686f6c6465722d7468756d627072696e74"
+    "wallet_identity_hex": "464e546f74506556656b2d4d4543685374727448455a395f5f665f52305236436e61436733517a7a535177"
   },
   "credential_format": "dev-hybrid-pq+cbor",
   "mutations": [
@@ -99,7 +99,7 @@
       "name": "changed-payload",
       "operations": [
         {
-          "offset": 108,
+          "offset": 109,
           "op": "xor",
           "value": 1
         }
@@ -110,7 +110,7 @@
       "name": "changed-disclosure",
       "operations": [
         {
-          "offset": 149,
+          "offset": 388,
           "op": "xor",
           "value": 1
         }
@@ -123,7 +123,7 @@
         {
           "delete": 44,
           "hex": "5573686172656420646973636c6f737572652074776f5573686172656420646973636c6f73757265206f6e65",
-          "offset": 148,
+          "offset": 387,
           "op": "replace"
         }
       ],
@@ -133,7 +133,7 @@
       "name": "changed-classical-kid",
       "operations": [
         {
-          "offset": 194,
+          "offset": 433,
           "op": "xor",
           "value": 1
         }
@@ -144,7 +144,7 @@
       "name": "changed-pq-kid",
       "operations": [
         {
-          "offset": 219,
+          "offset": 458,
           "op": "xor",
           "value": 1
         }
@@ -157,7 +157,7 @@
         {
           "delete": 1,
           "hex": "00",
-          "offset": 236,
+          "offset": 475,
           "op": "replace"
         }
       ],
@@ -169,7 +169,7 @@
         {
           "delete": 1,
           "hex": "08",
-          "offset": 236,
+          "offset": 475,
           "op": "replace"
         }
       ],
@@ -179,7 +179,7 @@
       "name": "invalid-classical-signature",
       "operations": [
         {
-          "offset": 240,
+          "offset": 479,
           "op": "xor",
           "value": 1
         }
@@ -190,7 +190,7 @@
       "name": "invalid-pq-signature",
       "operations": [
         {
-          "offset": 308,
+          "offset": 547,
           "op": "xor",
           "value": 1
         }
@@ -207,7 +207,7 @@
         },
         {
           "count": 3313,
-          "offset": 304,
+          "offset": 543,
           "op": "remove"
         }
       ],
@@ -223,7 +223,7 @@
         },
         {
           "count": 67,
-          "offset": 237,
+          "offset": 476,
           "op": "remove"
         }
       ],
