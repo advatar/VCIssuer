@@ -1,5 +1,13 @@
 # Status
 
+## ActiveChain schema mapping conformance
+
+- [x] Create issuer issue #28 and link ActiveChain issue #439.
+- [x] Freeze the canonical length-prefixed SHAKE256 derivation for supported credential profiles.
+- [x] Publish and consume byte-identical cross-repository vectors.
+- [x] Reject unknown, duplicate, malformed, or drifted mappings in targeted unit tests.
+- [ ] Merge both repository revisions and verify reachability from each `origin/main`.
+
 ## Restore issuer TLS service
 
 - [x] Create operations issue: https://github.com/advatar/VCIssuer/issues/19
