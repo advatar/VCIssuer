@@ -1,5 +1,10 @@
 # Status
 
+## Identity bridge conformance corpus
+
+- [x] [#30](https://github.com/advatar/VCIssuer/issues/30): consume the digest-locked synthetic
+  corpus shared with ActiveChain and EUWallet and reject mapping/vector drift.
+
 ## ActiveChain schema mapping conformance
 
 - [x] Create issuer issue #28 and link ActiveChain issue #439.
