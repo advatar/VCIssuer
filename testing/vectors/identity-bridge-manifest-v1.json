@@ -1,0 +1,18 @@
+{
+  "schema": "activechain.identity-bridge-conformance-manifest.v1",
+  "generator_revision": "identity-bridge-generator-v1",
+  "synthetic_data_only": true,
+  "corpus_digest": "556aad21a7060715de870dfe62bfb280d53189fb94247c772b38d682b245501b",
+  "files": [
+    {"path":"identity-bridge-conformance-v1.tsv","sha256":"fc3b9139d729b1f4cef80515f5e3d42e776d4f0d2113588590c90b76ab6eb2ce"},
+    {"path":"eudi-schema-mapping-v1.tsv","sha256":"2f89261b0d92783241bff853ff195869bd2ec05e65243e5e7372d391df13cfb5"},
+    {"path":"external-issuer-binding-v1.tsv","sha256":"1851c6b6532c400f389a13fd4aa09314ec29356552eb604c9455735eea520f36"},
+    {"path":"external-subject-binding-v1.tsv","sha256":"18ce1af64c530e9d0f7201befdb33eaf940b35378c55277595d0d93581f42a2a"},
+    {"path":"external-status-snapshot-v1.tsv","sha256":"59333b4e90944182ee2da8e99d89d55c2e9697d425081d13e0a7233fa42c61ce"}
+  ],
+  "consumers": ["advatar/ActiveChain", "advatar/VCIssuer", "advatar/EUWallet"],
+  "profiles": ["dc+sd-jwt", "mso_mdoc"],
+  "activechain_revision": "v1.4",
+  "expected_positive_vectors": 7,
+  "expected_negative_vectors": 23
+}

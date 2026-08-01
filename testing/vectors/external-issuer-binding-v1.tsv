@@ -1,0 +1,12 @@
+case	sequence	previous	status	chain	issuer	external_identity	profiles	finalized_height	expected	reason
+create	1	absent	active	matching	nonzero	nonzero	ordered_unique	10	accept	initial governed binding
+rotate	2	exact_previous	active	matching	same	same	ordered_unique	11	accept	key or profile rotation
+suspend	2	exact_previous	suspended	matching	same	same	ordered_unique	11	accept	emergency suspension
+resume	3	exact_previous	active	matching	same	same	ordered_unique	12	accept	governed resume
+zero_issuer	1	absent	active	matching	zero	nonzero	ordered_unique	10	reject	zero principal
+duplicate_profile	1	absent	active	matching	nonzero	nonzero	duplicate	10	reject	ambiguous allowlist
+wrong_previous	2	wrong	suspended	matching	same	same	ordered_unique	11	reject	rollback substitution
+wrong_chain	2	exact_previous	suspended	wrong	same	same	ordered_unique	11	reject	cross-network replay
+external_collision	1	absent	active	matching	different	duplicate	ordered_unique	11	reject	external identity ambiguity
+finality_rollback	2	exact_previous	active	matching	same	same	ordered_unique	10	reject	finalized height rollback
+retired_revival	3	exact_previous	active	matching	same	same	ordered_unique	12	reject	terminal lifecycle

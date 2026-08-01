@@ -1,0 +1,8 @@
+case	height	maximum_root_age	require_issuance_log	expected
+fresh-with-log	5	3	true	accept
+fresh-optional-log	6	3	false	accept
+maximum-age-boundary	8	3	true	accept
+older-than-maximum	9	3	true	reject
+freshness-end-exclusive	15	20	true	reject
+before-validity	4	20	true	reject
+missing-required-log	6	3	true	reject

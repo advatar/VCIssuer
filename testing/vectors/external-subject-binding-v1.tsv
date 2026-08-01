@@ -1,0 +1,13 @@
+case	profile	scope	device	private_witness	sequence	previous	nonce	wallet_authorization	expected	reason
+account	account	absent	absent	absent	1	absent	fresh	fresh	accept	principal and holder association
+pairwise	pairwise	verifier	absent	absent	1	absent	fresh	fresh	accept	verifier scoped pseudonym
+private	private_proof	purpose	absent	present	1	absent	fresh	fresh	accept	private witness binding
+device	device	absent	present	absent	1	absent	fresh	fresh	accept	holder device and principal binding
+pairwise_missing_scope	pairwise	absent	absent	absent	1	absent	fresh	fresh	reject	ambiguous global pseudonym
+account_with_scope	account	verifier	absent	absent	1	absent	fresh	fresh	reject	profile confusion
+device_without_attestation	device	absent	absent	absent	1	absent	fresh	fresh	reject	unbound device
+private_without_witness	private_proof	purpose	absent	absent	1	absent	fresh	fresh	reject	missing secret witness
+wrong_previous	device	absent	present	absent	2	wrong	fresh	fresh	reject	rollback substitution
+replayed_nonce	device	absent	present	absent	2	exact_previous	reused	fresh	reject	replay
+replayed_authorization	device	absent	present	absent	2	exact_previous	fresh	reused	reject	approval replay
+scope_migration	pairwise	asset	absent	absent	2	exact_previous	fresh	fresh	reject	new scope requires new association
