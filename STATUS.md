@@ -58,10 +58,10 @@
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/13
 - [x] Pin the high-level experimental profile to `euwallet-hybrid-pq-v1`, ES256 AND
   ML-DSA-65, and configuration `dev.advatar.hybrid-pq.sd-jwt.v1`.
-- [ ] Jointly freeze with EUWallet the credential-wrapper canonical-CBOR schema and shared
-  payload/disclosure/context plus real-key/signature adversarial corpus; replace or pin the
-  provisional issuer wrapper before claiming interoperability (EUWallet #90 and #91; backend and
-  atomic wallet sign/verify prerequisites #85, #87, and #88 are complete).
+- [x] Jointly freeze with EUWallet the credential-wrapper canonical-CBOR schema and shared
+  payload/disclosure/context plus real-key/signature adversarial corpus; the provisional issuer
+  wrapper is pinned as `HybridCredentialWrapperV1` by EUWallet issue #119 (backend and
+  atomic wallet sign/verify prerequisites #85, #87, #88, and use-case isolation #90 are complete).
 - [x] Complete the initial ML-DSA dependency review, key-custody design, SBOM delta, and
   evidence record; retain external audit, KAT, and shared-vector gates.
 - [x] Add disabled-by-default experimental issuance without changing certified EUDI paths.
@@ -71,9 +71,9 @@
   EUWallet PR #100.
 - [x] Consume the standalone public-key and dual-signature envelope schema frozen by EUWallet
   PR #103, without misrepresenting it as the still-unfrozen credential wrapper.
-- [ ] Publish and consume one deterministic cross-repository component corpus containing a real
+- [x] Publish and consume one deterministic cross-repository component corpus containing a real
   ES256 key/signature, ML-DSA-65 key/signature, canonical TBS, both frozen component envelopes,
-  and structural rejection mutations; retain the larger credential-wrapper corpus gate.
+  and structural rejection mutations (merged via VCIssuer PR #20 and EUWallet PR #107).
 - [x] Extend Lean with machine-checked hybrid AND-acceptance, same-TBS, generation-binding, and
   downgrade-rejection theorems, with zero `sorry` placeholders.
 - [x] Extend Tamarin with atomic hybrid issuance, same-message agreement, component-removal
@@ -81,5 +81,6 @@
 - [x] Add a reproducible formal-evidence report and publish its precisely scoped results on the
   issuer landing page.
 - [x] Merge the initial implementation and verify it is reachable from `origin/main`.
-- [ ] Pin and consume the complete shared credential-wrapper/signature vectors in both repositories,
-  merge the final interoperability update, and delete the issue branch.
+- [x] Pin and consume the complete shared credential-wrapper/signature vectors in both repositories
+  (`hybrid-pq-v1-wrapper-envelope.hex` plus twenty-one rejection mutations, byte-identical with
+  EUWallet), merge the final interoperability update, and delete the issue branch.
