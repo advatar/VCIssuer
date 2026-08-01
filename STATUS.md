@@ -65,6 +65,13 @@
 ## Experimental hybrid post-quantum issuance
 
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/13
+- [ ] Complete live profile publication and deployment follow-up:
+      https://github.com/advatar/VCIssuer/issues/23
+  - [ ] Publish the jointly frozen wrapper and completed shared-corpus status from the profile endpoint.
+  - [ ] Add regression tests and pass the full issuer verification gates.
+  - [ ] Enable the isolated experimental profile on the development deployment and verify live
+        metadata, profile, offer creation, and standard-profile isolation.
+  - [ ] Merge to `main`, verify reachability, close #23, and delete the issue branch.
 - [x] Pin the high-level experimental profile to `euwallet-hybrid-pq-v1`, ES256 AND
   ML-DSA-65, and configuration `dev.advatar.hybrid-pq.sd-jwt.v1`.
 - [x] Jointly freeze with EUWallet the credential-wrapper canonical-CBOR schema and shared

@@ -48,7 +48,7 @@ does not appear in the active host dependency tree; it arrives through the
 experimental dependency's target/build closure and remains a dependency-review
 follow-up rather than a production acceptance.
 
-## Evidence and remaining gates
+## Evidence and remaining production gates
 
 - ML-DSA exact lengths are checked before backend invocation: public key 1952,
   secret key 4032, signature 3309 bytes.
@@ -58,5 +58,11 @@ follow-up rather than a production acceptance.
 - Codec tests cover atomic AND acceptance, missing/invalid components,
   unsupported profiles/versions, payload/disclosure/context/generation
   mutation, duplicate/trailing/malformed/oversized CBOR, and downgrade input.
-- Shared EUWallet vectors, independent cross-library vectors, KAT evidence,
-  fuzzing, and external review remain open gates.
+- Shared EUWallet TBS, component and complete credential-wrapper corpora are consumed
+  byte-identically. The positive corpus is verified independently with AWS-LC ES256 and
+  RustCrypto ML-DSA-65, and all frozen structural/downgrade mutations are rejected.
+- The EUWallet backend qualification runs upstream NIST/Wycheproof vectors and bounded fuzzing.
+  The issuer additionally verifies the deterministic real-signature cross-library corpus against
+  libcrux. A directly pinned issuer-side NIST ACVP KAT, continuous issuer fuzz gate, mobile
+  side-channel evidence and independent external review remain production-acceptance gates; they
+  do not weaken the explicit development-only isolation boundary.
