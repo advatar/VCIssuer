@@ -18,6 +18,9 @@
     <string>https://issuer.advatar.systems</string>
     <key>ENABLE_EXPERIMENTAL_HYBRID_PQ</key>
     <string>true</string>
+    <!-- Public trust anchor for the development-only TLSNotary artifact signer. -->
+    <key>TLSN_TRUSTED_NOTARY_KEY</key>
+    <string>04618a7dc2561fd12aaaa58b2ded81cc6da01cd5b1eb46f008738f15d010776c3569fdf07a77f7706467e013cbc0357b2bdc819a428ef0f7b0375087b4bbb4f3a9</string>
     <key>RUST_LOG</key>
     <string>issuer_service=info</string>
   </dict>
