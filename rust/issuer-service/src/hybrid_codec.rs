@@ -659,12 +659,14 @@ fn byte_array(value: &Value) -> Result<Vec<Vec<u8>>, HybridCodecError> {
 mod tests {
     use std::{fs, path::PathBuf};
 
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use libcrux_ml_dsa::ml_dsa_65::{generate_key_pair, sign};
     use p256::ecdsa::{
         SigningKey,
         signature::{Signer, Verifier},
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use zeroize::Zeroize;
 
     use super::*;
@@ -677,8 +679,9 @@ mod tests {
     }
 
     fn issuer_context(generation: u64) -> HybridContext {
+        let (_, _, wallet_identity) = shared_provider_fixture();
         HybridContext {
-            wallet_identity: b"wallet-holder-thumbprint".to_vec(),
+            wallet_identity,
             issuer_identity: Some(b"https://issuer.example".to_vec()),
             key_generation: generation,
             transaction_id: Some(b"transaction-123".to_vec()),
@@ -689,6 +692,39 @@ mod tests {
             expires_at_epoch_seconds: 1_700_003_600,
             transcript_hash: None,
         }
+    }
+
+    fn shared_provider_fixture() -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        let holder_key = SigningKey::from_bytes((&[8_u8; 32]).into()).expect("fixed holder key");
+        let holder_point = holder_key.verifying_key().to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(holder_point.x().expect("P-256 x coordinate"));
+        let y = URL_SAFE_NO_PAD.encode(holder_point.y().expect("P-256 y coordinate"));
+        let holder_jwk = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+        let thumbprint = URL_SAFE_NO_PAD.encode(Sha256::digest(holder_jwk.as_bytes()));
+        let disclosures = vec![
+            b"shared disclosure one".to_vec(),
+            b"shared disclosure two".to_vec(),
+        ];
+        let hashes = disclosures
+            .iter()
+            .map(|disclosure| Value::Bytes(Sha256::digest(disclosure).to_vec()))
+            .collect();
+        let pair = |key: u64, value: Value| (Value::Integer(key.into()), value);
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(
+            &Value::Map(vec![
+                pair(1, Value::Text("https://issuer.example".into())),
+                pair(2, Value::Integer(1_700_000_000_u64.into())),
+                pair(3, Value::Integer(1_700_003_600_u64.into())),
+                pair(4, Value::Text("dev.advatar.hybrid-pq.credential.v1".into())),
+                pair(5, Value::Bytes(holder_jwk.into_bytes())),
+                pair(6, Value::Array(hashes)),
+                pair(7, Value::Bool(true)),
+            ]),
+            &mut payload,
+        )
+        .expect("canonical structured provider payload");
+        (payload, disclosures, thumbprint.into_bytes())
     }
 
     fn export_context() -> HybridContext {
@@ -1133,14 +1169,12 @@ mod tests {
         let classical_key =
             SigningKey::from_bytes((&[7_u8; 32]).into()).expect("fixed vector P-256 key");
         let mut pq_key_pair = generate_key_pair([0x42; 32]);
+        let (payload, disclosures, _) = shared_provider_fixture();
         let unsigned = UnsignedEnvelope {
             purpose: HybridPurpose::TestSdJwtWrapperV1,
             context: issuer_context(9),
-            payload: b"shared experimental credential payload".to_vec(),
-            disclosures: vec![
-                b"shared disclosure one".to_vec(),
-                b"shared disclosure two".to_vec(),
-            ],
+            payload,
+            disclosures,
             classical_kid: "shared-classical-kid-v1".into(),
             pq_kid: "shared-pq-kid-v1".into(),
             generation: 9,
@@ -1318,14 +1352,12 @@ mod tests {
         let classical_key =
             SigningKey::from_bytes((&[7_u8; 32]).into()).expect("fixed vector P-256 key");
         let mut pq_key_pair = generate_key_pair([0x42; 32]);
+        let (payload, disclosures, _) = shared_provider_fixture();
         let unsigned = UnsignedEnvelope {
             purpose: HybridPurpose::TestSdJwtWrapperV1,
             context: issuer_context(9),
-            payload: b"shared experimental credential payload".to_vec(),
-            disclosures: vec![
-                b"shared disclosure one".to_vec(),
-                b"shared disclosure two".to_vec(),
-            ],
+            payload,
+            disclosures,
             classical_kid: "shared-classical-kid-v1".into(),
             pq_kid: "shared-pq-kid-v1".into(),
             generation: 9,

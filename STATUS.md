@@ -104,6 +104,6 @@
   its explicit non-EUDI scope, and publish the issuer JWKS link (just-issuer issue #9).
 - [ ] [#26](https://github.com/advatar/VCIssuer/issues/26): make the jointly frozen wrapper
       consumable by the real wallet acquisition verifier.
-  - [ ] Replace the placeholder corpus payload with the canonical structured credential payload.
-  - [ ] Bind the holder JWK thumbprint to the signed wallet identity and retain all mutations.
+  - [x] Replace the placeholder corpus payload with the canonical structured credential payload.
+  - [x] Bind the holder JWK thumbprint to the signed wallet identity and retain all mutations.
   - [ ] Re-pin both repositories, pass issuer/wallet gates, merge, and verify `origin/main`.

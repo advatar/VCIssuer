@@ -96,6 +96,10 @@ the experimental profile endpoint, and the generation must equal the context
 The shared wrapper corpus (`hybrid-pq-v1-wrapper-envelope.hex` and
 `hybrid-pq-v1-wrapper-mutations.json`, with the committed TBS equal to
 `hybrid-pq-v1-component-tbs.hex`) is byte-identical in both repositories.
+Its payload is the same canonical seven-field credential payload emitted by the live issuer,
+including issuer, lifetime, VCT, holder JWK, disclosure hashes, and the development-only marker.
+The context wallet identity is the RFC 7638 thumbprint of that holder JWK, so the corpus exercises
+holder binding rather than a placeholder payload.
 VCIssuer generates and verifies it with its own codec; EUWallet decodes it with
 an independently implemented strict decoder and verifies both signatures with
 independent ES256 and ML-DSA-65 backends, rejecting all twenty-one mutations.
