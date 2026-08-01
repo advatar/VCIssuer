@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod activechain_schema;
 mod hybrid_codec;
 #[cfg(target_os = "macos")]
 mod hybrid_signer;
@@ -610,7 +611,7 @@ fn learning_profile(configuration_id: &str, name: &str, pid_bound: bool) -> Valu
 }
 
 fn sd_jwt_profile(configuration_id: &str, vct: &str, name: &str) -> Value {
-    json!({
+    let mut profile = json!({
         "format": "dc+sd-jwt",
         "scope": configuration_id,
         "vct": vct,
@@ -618,11 +619,21 @@ fn sd_jwt_profile(configuration_id: &str, vct: &str, name: &str) -> Value {
         "credential_signing_alg_values_supported": ["ES256"],
         "proof_types_supported": {"jwt": {"proof_signing_alg_values_supported": ["ES256"]}},
         "display": [{"name": name, "locale": "de-DE"}]
-    })
+    });
+    if let Some(schema) = activechain_schema::pinned_schema_id(configuration_id) {
+        profile
+            .as_object_mut()
+            .expect("profile is an object")
+            .insert(
+                "activechain_schema_id_v1".into(),
+                Value::String(hex::encode(schema)),
+            );
+    }
+    profile
 }
 
 fn mdoc_profile(configuration_id: &str, doc_type: &str, name: &str) -> Value {
-    json!({
+    let mut profile = json!({
         "format": "mso_mdoc",
         "scope": configuration_id,
         "doctype": doc_type,
@@ -630,7 +641,17 @@ fn mdoc_profile(configuration_id: &str, doc_type: &str, name: &str) -> Value {
         "credential_signing_alg_values_supported": ["ES256"],
         "proof_types_supported": {"jwt": {"proof_signing_alg_values_supported": ["ES256"]}},
         "display": [{"name": name, "locale": "de-DE"}]
-    })
+    });
+    if let Some(schema) = activechain_schema::pinned_schema_id(configuration_id) {
+        profile
+            .as_object_mut()
+            .expect("profile is an object")
+            .insert(
+                "activechain_schema_id_v1".into(),
+                Value::String(hex::encode(schema)),
+            );
+    }
+    profile
 }
 
 async fn oauth_metadata(State(state): State<AppState>) -> Json<Value> {

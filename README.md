@@ -53,6 +53,13 @@ profiles. The mdoc profiles use tagged issuer-signed items, namespace digests,
 holder COSE key binding, an MSO, and a COSE Sign1 carrying a Keychain-bound
 development document-signer certificate chain.
 
+Each supported non-hybrid credential configuration also publishes an
+`activechain_schema_id_v1`. It is derived from the exact configuration, credential type,
+development rulebook descriptor/version, and reviewed descriptor digest using the length-prefixed
+SHAKE256 profile shared with ActiveChain P-096. Unknown configurations receive no mapping; callers
+cannot supply or override this identifier. The current descriptors remain development-qualified
+until exact normative EUDI rulebook editions are selected.
+
 The learning-attestation development profile is available in independently identified and
 PID-bound variants. The PID-bound variant verifies a selectively disclosed PID presentation,
 matches it to the authoritative education subject, and requires a fresh PID-holder-key proof that
