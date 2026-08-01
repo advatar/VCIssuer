@@ -537,6 +537,8 @@ fn hybrid_metadata_profile(issuer: &str) -> Value {
         },
         "experimental_profile": hybrid_codec::PROFILE,
         "experimental_profile_document": format!("{issuer}/experimental/hybrid-pq/profile"),
+        "credential_wrapper_schema": "HybridCredentialWrapperV1",
+        "shared_vectors_status": "complete-component-and-wrapper-corpora",
         "development_only": true,
         "eudi_conformant": false,
         "display": [{
@@ -702,10 +704,10 @@ async fn hybrid_pq_profile_document(
         },
         "public_key_envelope": URL_SAFE_NO_PAD.encode(public_key_envelope),
         "component_envelope_schema": "euwallet-pr103-frozen",
-        "credential_wrapper_schema": "provisional-pending-euwallet-90-91",
+        "credential_wrapper_schema": "HybridCredentialWrapperV1",
         "development_only": true,
         "eudi_conformant": false,
-        "shared_vectors_status": "tbs-vectors-pass-component-schema-frozen-credential-vectors-pending",
+        "shared_vectors_status": "complete-component-and-wrapper-corpora",
         "verification_report": "docs/hybrid-pq-verification-report.md"
     })))
 }
@@ -2630,6 +2632,14 @@ mod tests {
         assert_eq!(profile["experimental_profile"], hybrid_codec::PROFILE);
         assert_eq!(profile["development_only"], true);
         assert_eq!(profile["eudi_conformant"], false);
+        assert_eq!(
+            profile["credential_wrapper_schema"],
+            "HybridCredentialWrapperV1"
+        );
+        assert_eq!(
+            profile["shared_vectors_status"],
+            "complete-component-and-wrapper-corpora"
+        );
         assert!(
             profile
                 .get("credential_signing_alg_values_supported")

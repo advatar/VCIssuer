@@ -23,7 +23,7 @@ plaintext secret buffer exists only for a signing operation and is zeroized
 before return. If the P-256 identity changes, a new ML-DSA key is generated and
 the logical generation advances.
 
-## Frozen TBS contract and provisional envelope
+## Frozen TBS contract and credential wrapper
 
 The issuer consumes the exact `HybridContextV1` and `HybridTBSV1` contract and
 three TBS vectors merged by EUWallet PR #100. The purpose is

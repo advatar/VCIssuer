@@ -16,6 +16,8 @@
     <string>https://issuer.advatar.systems</string>
     <key>CORS_ORIGINS</key>
     <string>https://issuer.advatar.systems</string>
+    <key>ENABLE_EXPERIMENTAL_HYBRID_PQ</key>
+    <string>true</string>
     <key>RUST_LOG</key>
     <string>issuer_service=info</string>
   </dict>
