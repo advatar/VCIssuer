@@ -7,7 +7,7 @@
 - [x] Restore a valid TLS certificate and route issuer traffic to the Keychain signer.
 - [x] Verify signed issuer metadata and the expected five-key JWKS over public HTTPS.
 - [x] Make the deployed smoke probe blocking again.
-- [ ] Merge, verify `origin/main`, close the issue, and delete the branch.
+- [x] Merge, verify `origin/main`, close the issue, and delete the branch.
 
 ## PID-bound education credentials
 
