@@ -93,3 +93,5 @@
 - [x] Pin and consume the complete shared credential-wrapper/signature vectors in both repositories
   (`hybrid-pq-v1-wrapper-envelope.hex` plus twenty-one rejection mutations, byte-identical with
   EUWallet), merge the final interoperability update, and delete the issue branch.
+- [x] Promote the live experimental hybrid-PQ profile above the fold on the landing page, retain
+  its explicit non-EUDI scope, and publish the issuer JWKS link (just-issuer issue #9).
