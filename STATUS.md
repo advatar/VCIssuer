@@ -67,8 +67,8 @@
 - [x] Create issuer issue: https://github.com/advatar/VCIssuer/issues/13
 - [ ] Complete live profile publication and deployment follow-up:
       https://github.com/advatar/VCIssuer/issues/23
-  - [ ] Publish the jointly frozen wrapper and completed shared-corpus status from the profile endpoint.
-  - [ ] Add regression tests and pass the full issuer verification gates.
+  - [x] Publish the jointly frozen wrapper and completed shared-corpus status from the profile endpoint.
+  - [x] Add regression tests and pass the full issuer verification gates.
   - [ ] Enable the isolated experimental profile on the development deployment and verify live
         metadata, profile, offer creation, and standard-profile isolation.
   - [ ] Merge to `main`, verify reachability, close #23, and delete the issue branch.
