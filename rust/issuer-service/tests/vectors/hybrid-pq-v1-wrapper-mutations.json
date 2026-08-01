@@ -1,0 +1,278 @@
+{
+  "binding": {
+    "classical_key_id": "shared-classical-kid-v1",
+    "generation": 9,
+    "pq_key_id": "shared-pq-kid-v1"
+  },
+  "context": {
+    "audience_hex": "68747470733a2f2f6973737565722e6578616d706c65",
+    "created_at_epoch_seconds": 1700000000,
+    "expires_at_epoch_seconds": 1700003600,
+    "issuer_identity_hex": "68747470733a2f2f6973737565722e6578616d706c65",
+    "key_generation": 9,
+    "nonce_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "transaction_id_hex": "7472616e73616374696f6e2d313233",
+    "wallet_identity_hex": "77616c6c65742d686f6c6465722d7468756d627072696e74"
+  },
+  "credential_format": "dev-hybrid-pq+cbor",
+  "mutations": [
+    {
+      "name": "bad-prefix",
+      "operations": [
+        {
+          "offset": 0,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "unsupported-version",
+      "operations": [
+        {
+          "offset": 37,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "noncanonical-version",
+      "operations": [
+        {
+          "delete": 1,
+          "hex": "1801",
+          "offset": 37,
+          "op": "replace"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "unknown-profile",
+      "operations": [
+        {
+          "offset": 60,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "non-wrapper-purpose",
+      "operations": [
+        {
+          "delete": 23,
+          "hex": "7077616c6c65742d6578706f72742d7631",
+          "offset": 62,
+          "op": "replace"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "unknown-purpose",
+      "operations": [
+        {
+          "offset": 84,
+          "op": "xor",
+          "value": 3
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "unsupported-format",
+      "operations": [
+        {
+          "offset": 87,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "changed-payload",
+      "operations": [
+        {
+          "offset": 108,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "changed-disclosure",
+      "operations": [
+        {
+          "offset": 149,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "reordered-disclosures",
+      "operations": [
+        {
+          "delete": 44,
+          "hex": "5573686172656420646973636c6f737572652074776f5573686172656420646973636c6f73757265206f6e65",
+          "offset": 148,
+          "op": "replace"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "changed-classical-kid",
+      "operations": [
+        {
+          "offset": 194,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "changed-pq-kid",
+      "operations": [
+        {
+          "offset": 219,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "zero-generation",
+      "operations": [
+        {
+          "delete": 1,
+          "hex": "00",
+          "offset": 236,
+          "op": "replace"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "mixed-generation",
+      "operations": [
+        {
+          "delete": 1,
+          "hex": "08",
+          "offset": 236,
+          "op": "replace"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "invalid-classical-signature",
+      "operations": [
+        {
+          "offset": 240,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "invalid-pq-signature",
+      "operations": [
+        {
+          "offset": 308,
+          "op": "xor",
+          "value": 1
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "classical-only-downgrade",
+      "operations": [
+        {
+          "offset": 35,
+          "op": "xor",
+          "value": 1
+        },
+        {
+          "count": 3313,
+          "offset": 304,
+          "op": "remove"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "pq-only-downgrade",
+      "operations": [
+        {
+          "offset": 35,
+          "op": "xor",
+          "value": 1
+        },
+        {
+          "count": 67,
+          "offset": 237,
+          "op": "remove"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "truncated",
+      "operations": [
+        {
+          "count": 1,
+          "op": "truncate"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "trailing-cbor",
+      "operations": [
+        {
+          "hex": "00",
+          "op": "append"
+        }
+      ],
+      "target": "wrapper-envelope"
+    },
+    {
+      "name": "appended-duplicate-field",
+      "operations": [
+        {
+          "offset": 35,
+          "op": "xor",
+          "value": 7
+        },
+        {
+          "hex": "0101",
+          "op": "append"
+        }
+      ],
+      "target": "wrapper-envelope"
+    }
+  ],
+  "profile": "euwallet-hybrid-pq-v1",
+  "provenance": {
+    "ml_dsa_65_keygen_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "ml_dsa_65_signing_randomness_hex": "2424242424242424242424242424242424242424242424242424242424242424",
+    "p256_private_scalar_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "test_only": true
+  },
+  "purpose": "test-sd-jwt-wrapper-v1",
+  "tbs_vector": "hybrid-pq-v1-component-tbs.hex",
+  "version": 1
+}

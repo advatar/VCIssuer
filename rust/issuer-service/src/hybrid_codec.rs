@@ -1,7 +1,8 @@
-//! Provisional private `euwallet-hybrid-pq-v1` envelope.
+//! Private `euwallet-hybrid-pq-v1` envelope, jointly frozen with `EUWallet`.
 //!
-//! The field assignments and vectors remain an interoperability checkpoint:
-//! they must be replaced or pinned when the shared `EUWallet` corpus lands.
+//! The credential wrapper implements `HybridCredentialWrapperV1` (EUWallet
+//! issue #119); the component containers implement the EUWallet PR #103
+//! schema. Both are pinned by shared cross-repository vectors.
 
 use std::{collections::BTreeSet, io::Cursor};
 
@@ -21,6 +22,7 @@ const ENVELOPE_MAGIC: &[u8] = b"EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0";
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_COMPONENT_ENVELOPE_BYTES: usize = 8 * 1024;
 const MAX_FIELD_BYTES: usize = 4_096;
+const MAX_KEY_ID_BYTES: usize = 128;
 const MIN_NONCE_BYTES: usize = 16;
 const MAX_NONCE_BYTES: usize = 64;
 
@@ -338,6 +340,21 @@ pub fn encode(
     {
         return Err(HybridCodecError::Missing);
     }
+    require_nonempty_bounded(&unsigned.payload)?;
+    for disclosure in &unsigned.disclosures {
+        require_nonempty_bounded(disclosure)?;
+    }
+    for kid in [&unsigned.classical_kid, &unsigned.pq_kid] {
+        if kid.is_empty() {
+            return Err(HybridCodecError::Malformed);
+        }
+        if kid.len() > MAX_KEY_ID_BYTES {
+            return Err(HybridCodecError::Oversized);
+        }
+    }
+    if unsigned.generation == 0 {
+        return Err(HybridCodecError::GenerationMismatch);
+    }
     let value = Value::Map(vec![
         pair(1, Value::Integer(Integer::from(VERSION))),
         pair(2, Value::Text(PROFILE.into())),
@@ -441,10 +458,25 @@ fn decode(
         return Err(HybridCodecError::Unsupported);
     }
     let payload = bytes(&fields[4].1)?.to_vec();
+    require_nonempty_bounded(&payload)?;
     let disclosures = byte_array(&fields[5].1)?;
+    for disclosure in &disclosures {
+        require_nonempty_bounded(disclosure)?;
+    }
     let classical_kid = text(&fields[6].1)?.to_owned();
     let pq_kid = text(&fields[7].1)?.to_owned();
+    for kid in [&classical_kid, &pq_kid] {
+        if kid.is_empty() {
+            return Err(HybridCodecError::Malformed);
+        }
+        if kid.len() > MAX_KEY_ID_BYTES {
+            return Err(HybridCodecError::Oversized);
+        }
+    }
     let generation = integer(&fields[8].1)?;
+    if generation == 0 {
+        return Err(HybridCodecError::GenerationMismatch);
+    }
     let classical = bytes(&fields[9].1)?.to_vec();
     let post_quantum = bytes(&fields[10].1)?.to_vec();
     if classical.len() != 64 || post_quantum.len() != pq_backend::SIGNATURE_BYTES {
@@ -1093,6 +1125,191 @@ mod tests {
             decode_public_key_envelope(&vec![0; MAX_COMPONENT_ENVELOPE_BYTES + 1]),
             Err(HybridCodecError::Oversized)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn consumes_deterministic_real_signature_wrapper_corpus() {
+        let classical_key =
+            SigningKey::from_bytes((&[7_u8; 32]).into()).expect("fixed vector P-256 key");
+        let mut pq_key_pair = generate_key_pair([0x42; 32]);
+        let unsigned = UnsignedEnvelope {
+            purpose: HybridPurpose::TestSdJwtWrapperV1,
+            context: issuer_context(9),
+            payload: b"shared experimental credential payload".to_vec(),
+            disclosures: vec![
+                b"shared disclosure one".to_vec(),
+                b"shared disclosure two".to_vec(),
+            ],
+            classical_kid: "shared-classical-kid-v1".into(),
+            pq_kid: "shared-pq-kid-v1".into(),
+            generation: 9,
+        };
+        let signed = tbs(&unsigned).expect("shared wrapper TBS");
+        assert_eq!(
+            hex::encode(&signed),
+            include_str!("../tests/vectors/hybrid-pq-v1-component-tbs.hex").trim(),
+            "the wrapper corpus commits to the shared component TBS"
+        );
+        let classical_signature: Signature = classical_key.sign(&signed);
+        let pq_signature = sign(&pq_key_pair.signing_key, &signed, &[], [0x24; 32])
+            .expect("fixed-randomness ML-DSA vector")
+            .as_slice()
+            .to_vec();
+        let classical_public_key = classical_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let pq_public_key = pq_key_pair.verification_key.as_slice().to_vec();
+        let encoded = encode(
+            &unsigned,
+            &EnvelopeSignatures {
+                classical: classical_signature.to_bytes().to_vec(),
+                post_quantum: pq_signature,
+            },
+        )
+        .expect("shared wrapper envelope");
+        pq_key_pair.signing_key.as_mut_slice().zeroize();
+
+        assert_or_update_vector("hybrid-pq-v1-wrapper-envelope.hex", &hex::encode(&encoded));
+
+        let find = |needle: &[u8]| {
+            encoded
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("wrapper corpus offset")
+        };
+        let magic_len = ENVELOPE_MAGIC.len();
+        let version_offset = magic_len + 2;
+        let profile_offset = find(PROFILE.as_bytes());
+        let purpose_offset = find(unsigned.purpose.id().as_bytes());
+        let format_offset = find(FORMAT.as_bytes());
+        let payload_offset = find(&unsigned.payload);
+        let first_disclosure_offset = find(&unsigned.disclosures[0]);
+        let array_head_offset = first_disclosure_offset - 2;
+        let disclosure_region = array_head_offset + 1
+            ..first_disclosure_offset
+                + unsigned.disclosures[0].len()
+                + 1
+                + unsigned.disclosures[1].len();
+        let mut swapped_disclosures = Vec::new();
+        for disclosure in [&unsigned.disclosures[1], &unsigned.disclosures[0]] {
+            swapped_disclosures.push(0x40 + u8::try_from(disclosure.len()).expect("short"));
+            swapped_disclosures.extend_from_slice(disclosure);
+        }
+        let classical_kid_offset = find(unsigned.classical_kid.as_bytes());
+        let pq_kid_offset = find(unsigned.pq_kid.as_bytes());
+        let generation_key_offset = pq_kid_offset + unsigned.pq_kid.len();
+        let generation_value_offset = generation_key_offset + 1;
+        let classical_signature_offset = generation_value_offset + 1 + 3;
+        let pq_entry_offset = classical_signature_offset + 64;
+        let pq_signature_offset = pq_entry_offset + 4;
+        assert_eq!(
+            pq_signature_offset + pq_backend::SIGNATURE_BYTES,
+            encoded.len(),
+            "frozen wrapper field layout"
+        );
+
+        let downgrade_purpose = HybridPurpose::WalletExportV1.id();
+        let mut downgrade_hex = vec![0x60 + u8::try_from(downgrade_purpose.len()).expect("short")];
+        downgrade_hex.extend_from_slice(downgrade_purpose.as_bytes());
+        let mutations = json!({
+            "version": 1,
+            "profile": PROFILE,
+            "purpose": unsigned.purpose.id(),
+            "credential_format": FORMAT,
+            "tbs_vector": "hybrid-pq-v1-component-tbs.hex",
+            "provenance": {
+                "p256_private_scalar_hex": hex::encode([7_u8; 32]),
+                "ml_dsa_65_keygen_seed_hex": hex::encode([0x42_u8; 32]),
+                "ml_dsa_65_signing_randomness_hex": hex::encode([0x24_u8; 32]),
+                "test_only": true
+            },
+            "binding": {
+                "classical_key_id": unsigned.classical_kid.clone(),
+                "pq_key_id": unsigned.pq_kid.clone(),
+                "generation": unsigned.generation
+            },
+            "context": {
+                "wallet_identity_hex": hex::encode(&unsigned.context.wallet_identity),
+                "issuer_identity_hex": hex::encode(unsigned.context.issuer_identity.as_deref().expect("issuer identity")),
+                "key_generation": unsigned.context.key_generation,
+                "transaction_id_hex": hex::encode(unsigned.context.transaction_id.as_deref().expect("transaction")),
+                "audience_hex": hex::encode(unsigned.context.audience.as_deref().expect("audience")),
+                "nonce_hex": hex::encode(&unsigned.context.nonce),
+                "created_at_epoch_seconds": unsigned.context.created_at_epoch_seconds,
+                "expires_at_epoch_seconds": unsigned.context.expires_at_epoch_seconds
+            },
+            "mutations": [
+                {"name":"bad-prefix", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":0, "value":1}]},
+                {"name":"unsupported-version", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":version_offset, "value":3}]},
+                {"name":"noncanonical-version", "target":"wrapper-envelope", "operations":[{"op":"replace", "offset":version_offset, "delete":1, "hex":"1801"}]},
+                {"name":"unknown-profile", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":profile_offset + PROFILE.len() - 1, "value":3}]},
+                {"name":"non-wrapper-purpose", "target":"wrapper-envelope", "operations":[{"op":"replace", "offset":purpose_offset - 1, "delete":unsigned.purpose.id().len() + 1, "hex":hex::encode(&downgrade_hex)}]},
+                {"name":"unknown-purpose", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":purpose_offset + unsigned.purpose.id().len() - 1, "value":3}]},
+                {"name":"unsupported-format", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":format_offset, "value":1}]},
+                {"name":"changed-payload", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":payload_offset, "value":1}]},
+                {"name":"changed-disclosure", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":first_disclosure_offset, "value":1}]},
+                {"name":"reordered-disclosures", "target":"wrapper-envelope", "operations":[{"op":"replace", "offset":disclosure_region.start, "delete":disclosure_region.end - disclosure_region.start, "hex":hex::encode(&swapped_disclosures)}]},
+                {"name":"changed-classical-kid", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":classical_kid_offset, "value":1}]},
+                {"name":"changed-pq-kid", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":pq_kid_offset, "value":1}]},
+                {"name":"zero-generation", "target":"wrapper-envelope", "operations":[{"op":"replace", "offset":generation_value_offset, "delete":1, "hex":"00"}]},
+                {"name":"mixed-generation", "target":"wrapper-envelope", "operations":[{"op":"replace", "offset":generation_value_offset, "delete":1, "hex":"08"}]},
+                {"name":"invalid-classical-signature", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":classical_signature_offset, "value":1}]},
+                {"name":"invalid-pq-signature", "target":"wrapper-envelope", "operations":[{"op":"xor", "offset":pq_signature_offset, "value":1}]},
+                {"name":"classical-only-downgrade", "target":"wrapper-envelope", "operations":[
+                    {"op":"xor", "offset":magic_len, "value":1},
+                    {"op":"remove", "offset":pq_entry_offset, "count":4 + pq_backend::SIGNATURE_BYTES}
+                ]},
+                {"name":"pq-only-downgrade", "target":"wrapper-envelope", "operations":[
+                    {"op":"xor", "offset":magic_len, "value":1},
+                    {"op":"remove", "offset":generation_value_offset + 1, "count":3 + 64}
+                ]},
+                {"name":"truncated", "target":"wrapper-envelope", "operations":[{"op":"truncate", "count":1}]},
+                {"name":"trailing-cbor", "target":"wrapper-envelope", "operations":[{"op":"append", "hex":"00"}]},
+                {"name":"appended-duplicate-field", "target":"wrapper-envelope", "operations":[
+                    {"op":"xor", "offset":magic_len, "value":7},
+                    {"op":"append", "hex":"0101"}
+                ]}
+            ]
+        });
+        assert_or_update_vector(
+            "hybrid-pq-v1-wrapper-mutations.json",
+            &serde_json::to_string_pretty(&mutations).expect("wrapper mutation JSON"),
+        );
+
+        let parameters = VerificationParameters {
+            purpose: unsigned.purpose,
+            context: &unsigned.context,
+            classical_kid: &unsigned.classical_kid,
+            pq_kid: &unsigned.pq_kid,
+            classical_public_key: &classical_public_key,
+            pq_public_key: &pq_public_key,
+            generation: unsigned.generation,
+        };
+        verify(&encoded, &parameters).expect("shared wrapper vector verifies");
+
+        let consumed: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(vector_path("hybrid-pq-v1-wrapper-mutations.json"))
+                .expect("shared wrapper mutation corpus"),
+        )
+        .expect("valid wrapper mutation JSON");
+        for mutation in consumed["mutations"].as_array().expect("mutation list") {
+            assert_eq!(
+                mutation["target"].as_str().expect("mutation target"),
+                "wrapper-envelope"
+            );
+            let mutated = apply_vector_operations(
+                encoded.clone(),
+                mutation["operations"].as_array().expect("operations"),
+            );
+            assert!(
+                verify(&mutated, &parameters).is_err(),
+                "{} must reject",
+                mutation["name"]
+            );
+        }
     }
 
     #[test]

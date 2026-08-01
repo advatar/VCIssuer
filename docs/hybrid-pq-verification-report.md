@@ -1,6 +1,6 @@
 # Hybrid-PQ verification report
 
-Evidence date: 2026-07-31. Profile: `euwallet-hybrid-pq-v1` (experimental,
+Evidence date: 2026-08-01. Profile: `euwallet-hybrid-pq-v1` (experimental,
 private, disabled by default, non-EUDI).
 
 Reproduce the hybrid-specific evidence gate from a clean checkout:
@@ -39,11 +39,21 @@ AWS-LC and the ML-DSA-65 signature with RustCrypto `ml-dsa`, then consumes the
 same mutation instructions. Fixed seeds and randomness are public test fixtures
 and are never production key material.
 
-PR #103 does not define the credential wrapper that carries the canonical
-payload, disclosures, key identifiers, generation, and issuance context. The
-complete shared credential-wrapper plus real ES256/ML-DSA signature/mutation
-corpus remains gated by EUWallet issues #90 and #91 and is not claimed here.
-Atomic wallet signing and verification prerequisites #87 and #88 are complete.
+The credential wrapper carrying the canonical payload, disclosures, key
+identifiers, generation, and both signatures is jointly frozen as
+`HybridCredentialWrapperV1` by EUWallet issue #119. The shared wrapper corpus
+consists of one positive wrapper envelope over the exact component-corpus
+fixture — its committed TBS is byte-identical to the shared component TBS — and
+twenty-one deterministic rejection mutations covering framing, version,
+profile, purpose, format, payload, disclosure (including reordering), key-ID
+and generation binding, invalid and removed component signatures, truncation,
+trailing bytes, duplicate fields, and noncanonical encoding. VCIssuer generates
+and verifies the corpus with its own codec; EUWallet decodes it with an
+independently implemented strict deterministic-CBOR decoder and verifies both
+signatures with independent AWS-LC ES256 and RustCrypto ML-DSA-65 backends.
+Both repositories pin identical SHA-256 checksums. Key identifiers and the
+generation field are not signed; both verifiers enforce the documented binding
+rule against the trusted logical identity and the context generation.
 
 ## Tier 2 — Lean 4 semantic proofs
 
@@ -90,11 +100,13 @@ side-channel resistance, primitive conformance, or external certification.
 
 The Rust evidence is supplied by `hybrid_codec`, `hybrid_signer`, and
 `pq_backend` unit tests plus the full workspace test/clippy/build gates. The
-workspace and local serial Keychain integration runs pass 33 tests in total
+workspace and local serial Keychain integration runs pass 34 tests in total
 (with no ignored test left unexecuted across the two local runs). Interactive
 Keychain tests are not run in the headless Actions session, where macOS denies
 Security.framework UI access; CI instead retains the deployed Keychain signer
-smoke check. The hybrid-specific gate passes all nine codec/vector tests. The
+smoke check. The hybrid-specific gate passes all ten codec/vector tests,
+including the shared wrapper-corpus generation, verification, and
+mutation-rejection test. The
 dependency decision, SBOM delta, RustSec result, key-wrapping design, and
 remaining qualification gates are recorded in
 `docs/hybrid-pq-dependency-evidence.md`.

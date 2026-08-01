@@ -58,11 +58,11 @@ The shared component corpus contains real signatures over one common TBS and
 twelve structural mutations; VCIssuer and EUWallet consume identical files and
 verify with independent ES256 and ML-DSA-65 implementations.
 
-The credential wrapper below remains provisional pending EUWallet issues #90
-and #91, which cover credential-wrapper integration and the complete
-adversarial corpus. Atomic wallet signing and verification prerequisites #87
-and #88 are complete. The wrapper begins
-with the mandatory magic bytes
+The credential wrapper below is jointly frozen as `HybridCredentialWrapperV1`
+by EUWallet issue #119, with the shared wrapper corpus consumed byte-for-byte
+in both repositories. Atomic wallet signing and verification prerequisites #87
+and #88, backend primitives #85, and use-case isolation #90 are complete. The
+wrapper begins with the mandatory magic bytes
 `EUWALLET-EXPERIMENTAL-HYBRID-PQ-V1\0`, followed by canonical CBOR integer map
 labels:
 
@@ -82,10 +82,22 @@ labels:
 
 The signed payload component is canonical CBOR containing labels `1`
 (credential payload bytes) and `2` (disclosure byte strings), so disclosure
-mutation is signed and fails closed.
+mutation — including reordering — is signed and fails closed.
 
-The issuer and EUWallet must jointly pin this credential wrapper by consuming
-the same payload/disclosure/context plus real-key/signature positive and
-mutation vectors before credential interoperability is claimed. The current
-formal and executable evidence is documented in
+Frozen bounds: the total wrapper is at most 65536 bytes; the payload is 1–4096
+bytes; every disclosure is nonempty and at most 4096 bytes; the committed
+payload map is at most 4096 bytes; both key IDs are 1–128 bytes of text; the
+generation is a nonzero unsigned integer; the purpose must be
+`test-sd-jwt-wrapper-v1` or `test-mdoc-wrapper-v1`. Key IDs and the generation
+field are not signed: verifiers bind them to the logical identity published on
+the experimental profile endpoint, and the generation must equal the context
+`key_generation`.
+
+The shared wrapper corpus (`hybrid-pq-v1-wrapper-envelope.hex` and
+`hybrid-pq-v1-wrapper-mutations.json`, with the committed TBS equal to
+`hybrid-pq-v1-component-tbs.hex`) is byte-identical in both repositories.
+VCIssuer generates and verifies it with its own codec; EUWallet decodes it with
+an independently implemented strict decoder and verifies both signatures with
+independent ES256 and ML-DSA-65 backends, rejecting all twenty-one mutations.
+The current formal and executable evidence is documented in
 `docs/hybrid-pq-verification-report.md`.
