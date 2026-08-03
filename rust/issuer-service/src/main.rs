@@ -30,9 +30,9 @@ use base64::{
 };
 use ciborium::value::Value as CborValue;
 use issuer_core::{
-    Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Evidence,
-    Instant, IssuerRole, KeyThumbprint, NonceId, Powers, ProfileId, Request, RequestId, Session,
-    SessionId, SubjectEvidence, SubjectId, TokenBinding, WalletEvidence, authorize_sign,
+    Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Delegation,
+    Evidence, Instant, IssuerRole, KeyThumbprint, NonceId, Powers, ProfileId, Request, RequestId,
+    Session, SessionId, SubjectEvidence, SubjectId, TokenBinding, WalletEvidence, authorize_sign,
 };
 use p256::{
     EncodedPoint,
@@ -66,6 +66,15 @@ const DEV_SVIPE_PID_SD_JWT: &str = svipe::PROFILE;
 const TLSN_EVIDENCE_SD_JWT: &str = "dev.advatar.tlsn.evidence.sd-jwt";
 const TLSN_EVIDENCE_VCT: &str = "dev.advatar.tlsn.evidence.1";
 const HYBRID_PQ_SD_JWT: &str = "dev.advatar.hybrid-pq.sd-jwt.v1";
+/// Power-of-representation mandate (SD-JWT VC). The delegator authenticates by presenting a PID
+/// (the natural-person path in the design brief), and the mandate is holder-bound (`cnf`) to the
+/// requesting agent key. `vct` is [`issuer_core::MANDATE_VCT`].
+const MANDATE_SD_JWT: &str = "urn:eudi:mandate:1:dc+sd-jwt:de";
+/// Mandates are short-lived (ARF Topic 29 `RP_02`); 15 minutes for the development flow.
+const MANDATE_LIFETIME_SECONDS: u64 = 900;
+/// Demo powers a mandate narrows to: present-identity + sign-document (a subset of the delegator's
+/// full taxonomy grant). Real flows take the requested powers from the request.
+const DEMO_MANDATE_POWERS: u64 = 0b11;
 const TLSN_ARTIFACT_VERSION: &str = "tlsn.notary-artifact.v1";
 const MAX_TLSN_ARTIFACT_BYTES: usize = 256 * 1024;
 const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
@@ -320,6 +329,7 @@ async fn main() {
         QEAA_PID_BOUND_SD_JWT,
         DEV_SVIPE_PID_SD_JWT,
         TLSN_EVIDENCE_SD_JWT,
+        MANDATE_SD_JWT,
     ]
     .into_iter()
     .map(|profile| {
@@ -515,7 +525,8 @@ fn issuer_metadata_value(state: &AppState) -> Value {
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
             QEAA_PID_BOUND_SD_JWT: learning_profile(QEAA_PID_BOUND_SD_JWT, "German learning QEAA (cryptographically bound to PID)", true)
             ,DEV_SVIPE_PID_SD_JWT: sd_jwt_profile(DEV_SVIPE_PID_SD_JWT, "dev.eu.europa.ec.eudi.pid.1", "Development PID (Svipe proofing only)"),
-            TLSN_EVIDENCE_SD_JWT: tlsn_profile
+            TLSN_EVIDENCE_SD_JWT: tlsn_profile,
+            MANDATE_SD_JWT: mandate_profile()
         }
     });
     if state.hybrid_pq_enabled {
@@ -607,6 +618,39 @@ fn learning_profile(configuration_id: &str, name: &str, pid_bound: bool) -> Valu
             json!({"required": false})
         },
     );
+    value
+}
+
+/// Power-of-representation mandate credential configuration. Modelled on the PID-bound learning
+/// profile (the delegator authenticates by presenting a PID), and additionally advertises the
+/// pinned scope taxonomy so verifiers know the closed set of powers a mandate may carry.
+fn mandate_profile() -> Value {
+    let mut value = sd_jwt_profile(
+        MANDATE_SD_JWT,
+        issuer_core::MANDATE_VCT,
+        "Power-of-representation mandate (agent delegation)",
+    );
+    let object = value.as_object_mut().expect("profile is an object");
+    object.insert(
+        "pid_binding".into(),
+        json!({
+            "required": true,
+            "pid_vct": PID_VCT,
+            "presentation_format": "dc+sd-jwt",
+            "binding_proof_alg_values_supported": ["ES256"]
+        }),
+    );
+    object.insert(
+        "mandate_scopes_supported".into(),
+        json!(
+            issuer_core::POWER_TAXONOMY
+                .iter()
+                .map(|(_, urn)| *urn)
+                .collect::<Vec<_>>()
+        ),
+    );
+    object.insert("development_only".into(), json!(true));
+    object.insert("eudi_conformant".into(), json!(false));
     value
 }
 
@@ -1152,7 +1196,7 @@ async fn credential(
         ));
     }
     let pid_binding = match request.credential_configuration_id.as_str() {
-        QEAA_PID_BOUND_SD_JWT => {
+        QEAA_PID_BOUND_SD_JWT | MANDATE_SD_JWT => {
             let supplied = request.pid_binding.as_ref().ok_or_else(|| {
                 oauth_error(
                     StatusCode::BAD_REQUEST,
@@ -1293,6 +1337,39 @@ async fn credential(
                 "this development build requires macOS Keychain",
             ))
         }
+        MANDATE_SD_JWT => {
+            #[cfg(target_os = "macos")]
+            {
+                // The kernel (authorize_kernel → authorize_sign) has already proven this mandate
+                // narrows within the delegator's grant and is bound to the agent (holder) key.
+                let delegator = pid_binding
+                    .as_ref()
+                    .expect("mandate issuance required a verified delegator PID")
+                    .subject;
+                let mandator = format!("urn:eudi:subject:{:032x}", delegator.0);
+                let mandate_jti = random_token();
+                let signer = state
+                    .credential_signers
+                    .get(MANDATE_SD_JWT)
+                    .expect("closed profile has a signer");
+                let credential = issue_mandate_sd_jwt(
+                    signer,
+                    &state.issuer,
+                    &verified_proof.holder_jwk,
+                    &mandator,
+                    Powers(DEMO_MANDATE_POWERS),
+                    &mandate_jti,
+                    now,
+                )?;
+                Ok(Json(json!({"credentials": [{"credential": credential}]})))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(oauth_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "credential_request_denied",
+                "this development build requires macOS Keychain",
+            ))
+        }
         _ => Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "unknown_credential_configuration",
@@ -1310,6 +1387,7 @@ fn valid_scope(scope: &str, hybrid_pq_enabled: bool) -> bool {
         QEAA_PID_BOUND_SD_JWT,
         DEV_SVIPE_PID_SD_JWT,
         TLSN_EVIDENCE_SD_JWT,
+        MANDATE_SD_JWT,
     ];
     let mut count = 0;
     for item in scope.split_ascii_whitespace() {
@@ -1330,6 +1408,7 @@ fn key_label(profile: &str) -> &'static str {
         QEAA_PID_BOUND_SD_JWT => "qeaa-pid-bound-sd-jwt",
         DEV_SVIPE_PID_SD_JWT => "svipe-pid-sd-jwt",
         TLSN_EVIDENCE_SD_JWT => "tlsn-evidence-sd-jwt",
+        MANDATE_SD_JWT => "mandate-sd-jwt",
         _ => unreachable!("only closed profile identifiers are used"),
     }
 }
@@ -1867,6 +1946,26 @@ fn reserve_tlsn_session(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Demo delegation context for a mandate issuance. The authenticated delegator grants the full
+/// pinned power taxonomy; the mandate narrows to [`DEMO_MANDATE_POWERS`], bound to the requesting
+/// agent key (`delegate_key`). Returns the delegation plus the narrowed requested powers. Real
+/// flows will take the requested powers from the credential request.
+fn demo_mandate_delegation(
+    delegator: SubjectId,
+    delegate_key: KeyThumbprint,
+    delegator_evidence: Evidence,
+) -> (Delegation, Powers) {
+    let delegation = Delegation {
+        delegator_evidence,
+        delegator,
+        delegate_key,
+        grant: Powers(issuer_core::TAXONOMY_MASK),
+        mandate_not_revoked: true,
+    };
+    (delegation, Powers(DEMO_MANDATE_POWERS))
+}
+
+#[allow(clippy::too_many_lines)]
 fn authorize_kernel(
     profile_name: &str,
     holder_jkt: &str,
@@ -1879,6 +1978,7 @@ fn authorize_kernel(
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
         TLSN_EVIDENCE_SD_JWT | HYBRID_PQ_SD_JWT => IssuerRole::DevelopmentEvidence,
+        MANDATE_SD_JWT => IssuerRole::Representation,
         _ => {
             return Err(oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -1893,14 +1993,17 @@ fn authorize_kernel(
         | QEAA_PID_BOUND_SD_JWT
         | DEV_SVIPE_PID_SD_JWT
         | TLSN_EVIDENCE_SD_JWT
-        | HYBRID_PQ_SD_JWT => CredentialFormat::SdJwtVc,
+        | HYBRID_PQ_SD_JWT
+        | MANDATE_SD_JWT => CredentialFormat::SdJwtVc,
         PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
     let profile_id = ProfileId(hash_u128(profile_name));
     let holder_key = KeyThumbprint(hash_u128(holder_jkt));
     let nonce_id = NonceId(hash_u128(nonce));
-    if profile_name == QEAA_PID_BOUND_SD_JWT && pid_subject.is_none() {
+    if (profile_name == QEAA_PID_BOUND_SD_JWT || profile_name == MANDATE_SD_JWT)
+        && pid_subject.is_none()
+    {
         return Err(oauth_error(
             StatusCode::FORBIDDEN,
             "credential_request_denied",
@@ -1915,6 +2018,14 @@ fn authorize_kernel(
         fresh_until: Instant(now.saturating_add(60)),
         accepted: true,
     };
+    // Power-of-representation: the presented-PID subject is the delegator, who grants the full
+    // pinned taxonomy; the mandate narrows to a fixed demo subset bound to the requesting agent key.
+    let mandate_context: Option<(Delegation, Powers)> =
+        if matches!(role, IssuerRole::Representation) {
+            Some(demo_mandate_delegation(subject, holder_key, evidence))
+        } else {
+            None
+        };
     let profile = CredentialProfile {
         id: profile_id,
         role,
@@ -1940,8 +2051,8 @@ fn authorize_kernel(
         dpop_key: holder_key,
         proof,
         expiry: Instant(now.saturating_add(3600)),
-        // Ignored for non-`Representation` roles; empty here.
-        requested_powers: Powers(0),
+        // For a mandate the requested powers are the narrowed subset; empty otherwise.
+        requested_powers: mandate_context.map_or(Powers(0), |(_, requested)| requested),
     };
     let session = Session {
         id: SessionId(hash_u128(&random_token())),
@@ -1978,7 +2089,7 @@ fn authorize_kernel(
         already_issued: false,
         wia_ka_maintenance_end: Instant(now.saturating_add(86_400)),
         hybrid_pq_bound: false,
-        delegation: None,
+        delegation: mandate_context.map(|(delegation, _)| delegation),
     };
     authorize_sign(session, request, Instant(now)).map_err(|_| {
         oauth_error(
@@ -2171,6 +2282,89 @@ fn issue_sd_jwt(
     let input = format!("{protected}.{payload}");
     let signature = signer.sign_es256(input.as_bytes()).map_err(|error| {
         tracing::error!(%error, "credential signing failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "credential signing is unavailable",
+        )
+    })?;
+    Ok(format!(
+        "{input}.{}~{}~",
+        URL_SAFE_NO_PAD.encode(signature),
+        disclosures.join("~")
+    ))
+}
+
+/// Pure builder for a power-of-representation mandate SD-JWT VC: the returned `(payload,
+/// disclosures)` carries top-level `vct` = [`issuer_core::MANDATE_VCT`], `cnf` = the delegate
+/// (agent) key, `cryptographically_bound_to` the delegator PID, a short validity window, and
+/// selectively-disclosable `mandator` / `scope` / `mandate_jti` claims. Cross-platform and
+/// unit-tested; the macOS wrapper below signs it. `scope` is the canonical taxonomy serialisation
+/// of `granted_powers`, so a verifier's URN-subset check mirrors the proven bitmask narrowing.
+fn mandate_sd_jwt_payload(
+    issuer: &Url,
+    delegate_jwk: &Value,
+    mandator: &str,
+    granted_powers: Powers,
+    mandate_jti: &str,
+    now: u64,
+) -> (Value, Vec<String>) {
+    let scopes = issuer_core::powers_to_scope_urns(granted_powers);
+    let claims: Vec<(&str, Value)> = vec![
+        ("mandator", json!(mandator)),
+        ("scope", json!(scopes)),
+        ("mandate_jti", json!(mandate_jti)),
+    ];
+    let mut disclosures = Vec::with_capacity(claims.len());
+    let mut digests = Vec::with_capacity(claims.len());
+    for (name, value) in &claims {
+        let disclosure = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!([random_token(), name, value]))
+                .expect("disclosure is serializable"),
+        );
+        digests.push(URL_SAFE_NO_PAD.encode(Sha256::digest(disclosure.as_bytes())));
+        disclosures.push(disclosure);
+    }
+    let payload = json!({
+        "iss": issuer.as_str().trim_end_matches('/'),
+        "iat": now,
+        "nbf": now,
+        "exp": now.saturating_add(MANDATE_LIFETIME_SECONDS),
+        "vct": issuer_core::MANDATE_VCT,
+        "cnf": {"jwk": delegate_jwk},
+        "cryptographically_bound_to": PID_VCT,
+        "_sd_alg": "sha-256",
+        "_sd": digests
+    });
+    (payload, disclosures)
+}
+
+#[cfg(target_os = "macos")]
+fn issue_mandate_sd_jwt(
+    signer: &KeychainSigner,
+    issuer: &Url,
+    delegate_jwk: &Value,
+    mandator: &str,
+    granted_powers: Powers,
+    mandate_jti: &str,
+    now: u64,
+) -> Result<String, (StatusCode, Json<OAuthError>)> {
+    let (payload, disclosures) = mandate_sd_jwt_payload(
+        issuer,
+        delegate_jwk,
+        mandator,
+        granted_powers,
+        mandate_jti,
+        now,
+    );
+    let header = json!({"alg":"ES256", "typ":"dc+sd-jwt", "kid":signer.kid()});
+    let protected =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header is serializable"));
+    let payload =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload is serializable"));
+    let input = format!("{protected}.{payload}");
+    let signature = signer.sign_es256(input.as_bytes()).map_err(|error| {
+        tracing::error!(%error, "mandate credential signing failed");
         oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -2631,6 +2825,68 @@ mod tests {
             "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         ));
+    }
+
+    #[test]
+    fn mandate_payload_carries_agent_cnf_scope_and_delegator_binding() {
+        let issuer = Url::parse("https://issuer.example/").expect("valid issuer url");
+        let delegate_jwk = json!({"kty":"EC","crv":"P-256","x":"agent-x","y":"agent-y"});
+        let now = 1_000u64;
+        let (payload, disclosures) = mandate_sd_jwt_payload(
+            &issuer,
+            &delegate_jwk,
+            "urn:eudi:subject:demo-delegator",
+            Powers(DEMO_MANDATE_POWERS),
+            "mandate-jti-123",
+            now,
+        );
+
+        // Top-level, always-visible claims: mandate vct, agent (delegate) holder binding, and the
+        // reused delegator-PID binding claim, with a short validity window.
+        assert_eq!(payload["vct"], json!(issuer_core::MANDATE_VCT));
+        assert_eq!(payload["cnf"]["jwk"], delegate_jwk);
+        assert_eq!(payload["cryptographically_bound_to"], json!(PID_VCT));
+        assert_eq!(payload["exp"], json!(now + MANDATE_LIFETIME_SECONDS));
+        assert_eq!(payload["_sd_alg"], json!("sha-256"));
+
+        // Every disclosure hashes into `_sd`, and the selectively-disclosable claims are correct.
+        let sd = payload["_sd"].as_array().expect("_sd is an array");
+        assert_eq!(sd.len(), disclosures.len());
+        let mut disclosed = std::collections::HashMap::new();
+        for disclosure in &disclosures {
+            let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(disclosure.as_bytes()));
+            assert!(
+                sd.iter().any(|entry| entry == &json!(digest)),
+                "disclosure digest is present in _sd"
+            );
+            let bytes = URL_SAFE_NO_PAD
+                .decode(disclosure)
+                .expect("disclosure is base64url");
+            let parsed: Value = serde_json::from_slice(&bytes).expect("disclosure is json");
+            let array = parsed
+                .as_array()
+                .expect("disclosure is [salt, name, value]");
+            disclosed.insert(
+                array[1]
+                    .as_str()
+                    .expect("claim name is a string")
+                    .to_owned(),
+                array[2].clone(),
+            );
+        }
+        assert_eq!(
+            disclosed["mandator"],
+            json!("urn:eudi:subject:demo-delegator")
+        );
+        assert_eq!(disclosed["mandate_jti"], json!("mandate-jti-123"));
+        // The scope is the canonical taxonomy serialisation of the narrowed powers.
+        assert_eq!(
+            disclosed["scope"],
+            json!([
+                "urn:eudi:mandate:power:present-identity",
+                "urn:eudi:mandate:power:sign-document",
+            ])
+        );
     }
 
     #[test]

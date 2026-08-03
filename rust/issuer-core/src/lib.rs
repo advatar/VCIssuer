@@ -55,6 +55,56 @@ impl Powers {
     }
 }
 
+/// The pinned power-of-representation mandate credential type (SD-JWT VC `vct`), per the delegation
+/// design brief. A distinct attestation type (ARF Topic 29) whose holder is the delegate agent.
+pub const MANDATE_VCT: &str = "urn:eudi:mandate:1";
+
+/// Canonical, pinned power → scope-URN taxonomy: each entry maps ONE power bit to a stable scope
+/// URN. This is the single source of truth for the mandate scope model — the issuer serialises
+/// `granted_powers` to these URNs and the verifier checks `requested ⊆ granted` over the URN set.
+/// Because the map is one-bit ↔ one-URN and injective, scope-set containment agrees exactly with
+/// [`Powers::subset_of`] over taxonomy-covered powers (proved by `taxonomy_bridges_subset` below),
+/// which is what makes the verifier's decidable subset relation sound.
+pub const POWER_TAXONOMY: [(u32, &str); 6] = [
+    (0, "urn:eudi:mandate:power:present-identity"),
+    (1, "urn:eudi:mandate:power:sign-document"),
+    (2, "urn:eudi:mandate:power:authorise-payment"),
+    (3, "urn:eudi:mandate:power:manage-subscription"),
+    (4, "urn:eudi:mandate:power:access-records"),
+    (5, "urn:eudi:mandate:power:administer-account"),
+];
+
+/// Bitmask of every bit assigned a scope URN in [`POWER_TAXONOMY`]. A mandate's requested powers
+/// must lie within this mask to be expressible on the wire.
+pub const TAXONOMY_MASK: u64 = {
+    let mut mask = 0u64;
+    let mut i = 0;
+    while i < POWER_TAXONOMY.len() {
+        mask |= 1u64 << POWER_TAXONOMY[i].0;
+        i += 1;
+    }
+    mask
+};
+
+/// Serialise a `Powers` bitmask to its canonical, taxonomy-ordered scope URNs. Bits with no entry
+/// in [`POWER_TAXONOMY`] are dropped (they are not expressible as a wire scope).
+#[must_use]
+pub fn powers_to_scope_urns(powers: Powers) -> Vec<&'static str> {
+    POWER_TAXONOMY
+        .iter()
+        .filter(|(bit, _)| powers.0 & (1u64 << bit) != 0)
+        .map(|(_, urn)| *urn)
+        .collect()
+}
+
+/// The verifier's decidable scope-containment relation: every requested scope URN is present in the
+/// granted set. Mirrored 1:1 on the VCVerifier side; over [`POWER_TAXONOMY`] it agrees with
+/// [`Powers::subset_of`].
+#[must_use]
+pub fn scope_urns_subset(requested: &[&str], granted: &[&str]) -> bool {
+    requested.iter().all(|urn| granted.contains(urn))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialFormat {
     SdJwtVc,
@@ -531,5 +581,49 @@ mod tests {
             authorize_sign(session, request, NOW),
             Err(DecisionError::NotAuthorized)
         );
+    }
+
+    #[test]
+    fn taxonomy_mask_covers_exactly_the_taxonomy_bits() {
+        let expected: u64 = POWER_TAXONOMY.iter().map(|(bit, _)| 1u64 << bit).sum();
+        assert_eq!(TAXONOMY_MASK, expected);
+        // Every taxonomy power is a subset of the full taxonomy mask.
+        for (bit, _) in POWER_TAXONOMY {
+            assert!(Powers(1u64 << bit).subset_of(Powers(TAXONOMY_MASK)));
+        }
+    }
+
+    #[test]
+    fn powers_to_scope_urns_is_canonical_and_drops_untaxonomised_bits() {
+        // bits 0 and 1 → the first two taxonomy URNs, in taxonomy order.
+        assert_eq!(
+            powers_to_scope_urns(Powers(0b11)),
+            vec![
+                "urn:eudi:mandate:power:present-identity",
+                "urn:eudi:mandate:power:sign-document",
+            ]
+        );
+        // A bit outside the taxonomy contributes no wire scope.
+        assert!(powers_to_scope_urns(Powers(1u64 << 60)).is_empty());
+        assert!(powers_to_scope_urns(Powers(0)).is_empty());
+    }
+
+    #[test]
+    fn taxonomy_bridges_subset_exhaustively() {
+        // Over the whole taxonomy space, the wire scope-set containment relation agrees exactly
+        // with the kernel's `Powers::subset_of` — this is what makes the verifier's decidable
+        // URN-subset check a sound stand-in for the proven bitmask narrowing.
+        let n = POWER_TAXONOMY.len();
+        for a in 0u64..(1 << n) {
+            for b in 0u64..(1 << n) {
+                let sa = powers_to_scope_urns(Powers(a));
+                let sb = powers_to_scope_urns(Powers(b));
+                assert_eq!(
+                    Powers(a).subset_of(Powers(b)),
+                    scope_urns_subset(&sa, &sb),
+                    "mismatch for a={a:#08b} b={b:#08b}"
+                );
+            }
+        }
     }
 }
