@@ -30,9 +30,10 @@ use base64::{
 };
 use ciborium::value::Value as CborValue;
 use issuer_core::{
-    Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Delegation,
-    Evidence, Instant, IssuerRole, KeyThumbprint, NonceId, Powers, ProfileId, Request, RequestId,
-    Session, SessionId, SubjectEvidence, SubjectId, TokenBinding, WalletEvidence, authorize_sign,
+    Authorization, ChipLivenessEvidence, CredentialFormat, CredentialProfile, CredentialProof,
+    DatasetId, Delegation, Evidence, Instant, IssuerRole, KeyThumbprint, NonceId, Powers,
+    ProfileId, Request, RequestId, Session, SessionId, SubjectEvidence, SubjectId, TokenBinding,
+    WalletEvidence, authorize_sign,
 };
 use p256::{
     EncodedPoint,
@@ -62,6 +63,18 @@ const QEAA_SD_JWT: &str = "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt
 const QEAA_PID_BOUND_SD_JWT: &str =
     "urn:eu.europa.ec.eudi:learning:credential:1:dc+sd-jwt:de:pid-bound";
 const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
+/// NFC-sourced PID (SD-JWT VC). The subject is proofed by an in-wallet `eMRTD` (passport / national
+/// eID) chip read plus a fresh holder liveness capture, attested by a trusted reader/liveness
+/// backend and verified here; the kernel's `require_chip_liveness` gate (proved in Lean) refuses to
+/// mint without verified Passive Authentication, anti-cloning, and portrait-matched liveness. The
+/// `vct` is a real PID (`eu.europa.ec.eudi.pid.1`); the configuration id is distinct so the NFC
+/// proofing path has its own scope, signer, and metadata entry.
+const PID_FROM_EMRTD_SD_JWT: &str = "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc";
+/// The liveness assurance marker a trusted reader/liveness attestation must carry (mirrors the
+/// Svipe `face_present:iproov:gpa` requirement): a genuine-presence `iProov` capture.
+const EMRTD_REQUIRED_LIVENESS: &str = "iproov:gpa";
+/// Upper bound on the `eMRTD` evidence attestation (a compact JWS that MAY embed a base64 portrait).
+const MAX_EMRTD_EVIDENCE_BYTES: usize = 256 * 1024;
 const DEV_SVIPE_PID_SD_JWT: &str = svipe::PROFILE;
 const TLSN_EVIDENCE_SD_JWT: &str = "dev.advatar.tlsn.evidence.sd-jwt";
 const TLSN_EVIDENCE_VCT: &str = "dev.advatar.tlsn.evidence.1";
@@ -83,6 +96,9 @@ const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
 struct AppState {
     issuer: Url,
     trusted_notary_key: Vec<u8>,
+    /// SEC1 P-256 public key of the trusted `eMRTD`-reader / liveness backend that attests NFC PID
+    /// evidence. `None` disables the NFC-sourced PID endpoint (the profile then fails closed).
+    trusted_emrtd_reader_key: Option<Vec<u8>>,
     hybrid_pq_enabled: bool,
     inner: Arc<Mutex<VolatileState>>,
     #[cfg(target_os = "macos")]
@@ -221,6 +237,9 @@ struct CredentialRequest {
     credential_configuration_id: String,
     proofs: CredentialProofs,
     pid_binding: Option<PidBindingObject>,
+    /// Evidence for the NFC-sourced PID profile: an attestation from a trusted `eMRTD`-reader /
+    /// liveness backend. Accepted only by [`PID_FROM_EMRTD_SD_JWT`]; rejected on every other profile.
+    emrtd_evidence: Option<EmrtdEvidenceObject>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +274,77 @@ struct BindingProofClaims {
 struct VerifiedPidBinding {
     subject: SubjectId,
     jti: String,
+}
+
+/// The NFC-sourced PID evidence a wallet submits: a compact JWS signed by a trusted `eMRTD`-reader /
+/// liveness backend, carrying the chip-read verdicts, the DG1 identity, and the liveness result.
+#[derive(Deserialize)]
+struct EmrtdEvidenceObject {
+    attestation: String,
+}
+
+/// Liveness sub-claim of the `eMRTD` evidence attestation: a genuine-presence result bound to the
+/// chip portrait. `assurance` must contain [`EMRTD_REQUIRED_LIVENESS`].
+#[derive(Deserialize)]
+struct EmrtdLivenessClaim {
+    assurance: String,
+    matched_portrait: bool,
+}
+
+/// DG1 (machine-readable-zone) identity carried by the attestation, already normalised by the
+/// reader to ISO shapes (`birthdate` = `YYYY-MM-DD`, `date_of_expiry` = `YYYY-MM-DD`).
+#[derive(Deserialize)]
+struct EmrtdMrzClaim {
+    family_name: String,
+    given_name: String,
+    birthdate: String,
+    nationality: String,
+    issuing_country: String,
+    document_number: String,
+    date_of_expiry: String,
+}
+
+/// Claims of the `eMRTD` evidence attestation JWS. `passive_authentication` / `chip_authentic` are the
+/// reader's reproduced Passive-Authentication (SOD→CSCA + DG hashes) and anti-cloning (CA/AA/CAM)
+/// verdicts; they map 1:1 onto the kernel's `ChipLivenessEvidence` booleans.
+#[derive(Deserialize)]
+struct EmrtdEvidenceClaims {
+    aud: String,
+    iat: u64,
+    exp: u64,
+    nonce: String,
+    jti: String,
+    new_holder_jkt: String,
+    passive_authentication: bool,
+    chip_authentic: bool,
+    liveness: EmrtdLivenessClaim,
+    mrz: EmrtdMrzClaim,
+    #[serde(default)]
+    portrait: Option<String>,
+}
+
+/// PID subject claims sourced from a verified DG1 read (replaces the demo Mustermann/Erika constants
+/// for the NFC-sourced PID). `age_over_18` is derived by the issuer from `birthdate`, not attested.
+struct PidSubjectClaims {
+    family_name: String,
+    given_name: String,
+    birthdate: String,
+    nationality: String,
+    issuing_country: String,
+    age_over_18: bool,
+    portrait: Option<String>,
+}
+
+/// The verified output of an `eMRTD` evidence attestation: a stable subject derived from the document
+/// identity, the attestation `jti` (replay guard), the kernel-facing verdict booleans, and the DG1
+/// PID claims to mint.
+struct VerifiedChipLiveness {
+    subject: SubjectId,
+    jti: String,
+    sod_passive_auth: bool,
+    chip_authentic: bool,
+    liveness_matched: bool,
+    claims: PidSubjectClaims,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +403,15 @@ async fn main() {
         hex::decode(trusted_notary_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
     VerifyingKey::from_sec1_bytes(&trusted_notary_key)
         .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
+    // Optional: the trusted `eMRTD`-reader / liveness backend key that attests NFC PID evidence.
+    // Absent → the NFC-sourced PID endpoint is disabled (fails closed) and existing deployments are
+    // unaffected.
+    let trusted_emrtd_reader_key = std::env::var("EMRTD_TRUSTED_READER_KEY").ok().map(|hex| {
+        let key = hex::decode(hex).expect("EMRTD_TRUSTED_READER_KEY must be valid hex");
+        VerifyingKey::from_sec1_bytes(&key)
+            .expect("EMRTD_TRUSTED_READER_KEY must be a SEC1 P-256 public key");
+        key
+    });
     let address: SocketAddr = std::env::var("LISTEN_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
@@ -323,6 +422,7 @@ async fn main() {
     #[cfg(target_os = "macos")]
     let credential_signers = [
         PID_SD_JWT,
+        PID_FROM_EMRTD_SD_JWT,
         PID_MDOC,
         EAA_MDOC,
         QEAA_SD_JWT,
@@ -363,6 +463,7 @@ async fn main() {
     let app = app(AppState {
         issuer,
         trusted_notary_key,
+        trusted_emrtd_reader_key,
         hybrid_pq_enabled,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
@@ -520,6 +621,7 @@ fn issuer_metadata_value(state: &AppState) -> Value {
         "batch_credential_issuance": {"batch_size": 1},
         "credential_configurations_supported": {
             PID_SD_JWT: sd_jwt_profile(PID_SD_JWT, "eu.europa.ec.eudi.pid.1", "German PID (SD-JWT VC)"),
+            PID_FROM_EMRTD_SD_JWT: pid_from_emrtd_profile(),
             PID_MDOC: mdoc_profile(PID_MDOC, "eu.europa.ec.eudi.pid.1", "German PID (mdoc)"),
             EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
@@ -648,6 +750,33 @@ fn mandate_profile() -> Value {
                 .map(|(_, urn)| *urn)
                 .collect::<Vec<_>>()
         ),
+    );
+    object.insert("development_only".into(), json!(true));
+    object.insert("eudi_conformant".into(), json!(false));
+    value
+}
+
+/// NFC-sourced PID credential configuration. A real PID (`vct = eu.europa.ec.eudi.pid.1`) whose
+/// subject is proofed by an in-wallet `eMRTD` chip read + fresh holder liveness, attested by a trusted
+/// reader/liveness backend and gated by the Lean-proved `require_chip_liveness` kernel conjunct.
+/// Advertised as development-only until `VCIssuer` independently re-runs Passive Authentication
+/// against a provisioned CSCA master list.
+fn pid_from_emrtd_profile() -> Value {
+    let mut value = sd_jwt_profile(
+        PID_FROM_EMRTD_SD_JWT,
+        PID_VCT,
+        "German PID (NFC chip + liveness proofed)",
+    );
+    let object = value.as_object_mut().expect("profile is an object");
+    object.insert(
+        "identity_assurance".into(),
+        json!({
+            "source": "emrtd_chip_read",
+            "chip_authentication": true,
+            "passive_authentication": true,
+            "holder_liveness": EMRTD_REQUIRED_LIVENESS,
+            "evidence_binding": "trusted_reader_attestation_jws"
+        }),
     );
     object.insert("development_only".into(), json!(true));
     object.insert("eudi_conformant".into(), json!(false));
@@ -1241,11 +1370,56 @@ async fn credential(
         }
         _ => None,
     };
+    // NFC-sourced PID: verify the trusted-reader `eMRTD` chip + liveness attestation (cross-platform;
+    // it only needs the configured reader key). The verdicts flow into the kernel gate below.
+    let chip_liveness = match request.credential_configuration_id.as_str() {
+        PID_FROM_EMRTD_SD_JWT => {
+            let supplied = request.emrtd_evidence.as_ref().ok_or_else(|| {
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_proof",
+                    "the NFC-sourced PID profile requires emrtd_evidence",
+                )
+            })?;
+            let reader_key = state.trusted_emrtd_reader_key.as_deref().ok_or_else(|| {
+                oauth_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "credential_request_denied",
+                    "NFC-sourced PID issuance is not configured on this issuer",
+                )
+            })?;
+            let verified = verify_emrtd_evidence(
+                supplied,
+                reader_key,
+                &state.issuer,
+                &verified_proof.nonce,
+                &verified_proof.holder_jkt,
+                now,
+            )?;
+            if !inner.binding_jtis.insert(verified.jti.clone()) {
+                return Err(oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_proof",
+                    "`eMRTD` evidence attestation jti has already been used",
+                ));
+            }
+            Some(verified)
+        }
+        _ if request.emrtd_evidence.is_some() => {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "emrtd_evidence is not accepted by this credential profile",
+            ));
+        }
+        _ => None,
+    };
     let mandate_grant = authorize_kernel(
         &request.credential_configuration_id,
         &verified_proof.holder_jkt,
         &verified_proof.nonce,
         pid_binding.as_ref().map(|binding| binding.subject),
+        chip_liveness.as_ref(),
         now,
     )?;
     *inner
@@ -1255,7 +1429,11 @@ async fn credential(
     drop(inner);
 
     match request.credential_configuration_id.as_str() {
-        PID_SD_JWT | QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | TLSN_EVIDENCE_SD_JWT => {
+        PID_SD_JWT
+        | PID_FROM_EMRTD_SD_JWT
+        | QEAA_SD_JWT
+        | QEAA_PID_BOUND_SD_JWT
+        | TLSN_EVIDENCE_SD_JWT => {
             #[cfg(target_os = "macos")]
             {
                 let signer = state
@@ -1269,6 +1447,7 @@ async fn credential(
                     &verified_proof.holder_jwk,
                     now,
                     tlsn_evidence.as_ref(),
+                    chip_liveness.as_ref().map(|c| &c.claims),
                 )?;
                 Ok(Json(json!({"credentials": [{"credential": credential}]})))
             }
@@ -1381,6 +1560,7 @@ async fn credential(
 fn valid_scope(scope: &str, hybrid_pq_enabled: bool) -> bool {
     let allowed = [
         PID_SD_JWT,
+        PID_FROM_EMRTD_SD_JWT,
         PID_MDOC,
         EAA_MDOC,
         QEAA_SD_JWT,
@@ -1402,6 +1582,7 @@ fn valid_scope(scope: &str, hybrid_pq_enabled: bool) -> bool {
 fn key_label(profile: &str) -> &'static str {
     match profile {
         PID_SD_JWT => "pid-sd-jwt",
+        PID_FROM_EMRTD_SD_JWT => "pid-from-emrtd-sd-jwt",
         PID_MDOC => "pid-mdoc",
         EAA_MDOC => "eaa-mdoc",
         QEAA_SD_JWT => "qeaa-sd-jwt",
@@ -1738,6 +1919,196 @@ fn verify_pid_binding(
     })
 }
 
+/// Derive `age_over_18` from an ISO `YYYY-MM-DD` birthdate at `now` (issuer-computed, not attested).
+/// Returns `false` on any parse failure — fail-closed for a claim that must never over-assert.
+fn age_over_18(birthdate_iso: &str, now: u64) -> bool {
+    let parts: Vec<&str> = birthdate_iso.split('-').collect();
+    let (Ok(birth_year), Ok(birth_month), Ok(birth_day)) = (
+        parts.first().copied().unwrap_or_default().parse::<i32>(),
+        parts.get(1).copied().unwrap_or_default().parse::<u8>(),
+        parts.get(2).copied().unwrap_or_default().parse::<u8>(),
+    ) else {
+        return false;
+    };
+    let Ok(seconds) = i64::try_from(now) else {
+        return false;
+    };
+    let Ok(today) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return false;
+    };
+    let today = (today.year(), u8::from(today.month()), today.day());
+    today >= (birth_year + 18, birth_month, birth_day)
+}
+
+/// Verify a trusted-reader `eMRTD` evidence attestation for the NFC-sourced PID and reduce it to the
+/// kernel-facing [`VerifiedChipLiveness`]. This layer proves the attestation is *authentic, fresh,
+/// and bound* to this issuance session and wallet key, and that the document is not expired; it does
+/// NOT itself decide the allow/deny — it passes the three chip-liveness verdict booleans through to
+/// the (Lean-proved) kernel gate, which is the authoritative decision.
+///
+/// Development-only trust boundary: the chip-read verdicts (Passive Authentication over EF.SOD →
+/// CSCA + DG hashes, and anti-cloning) are asserted by the trusted reader/liveness backend that ran
+/// the ICAO 9303 protocol, not independently reproduced here. Production hardening — `VCIssuer` HPKE-
+/// decrypting the raw CBOR result blob and re-running CMS Passive Authentication against a
+/// provisioned CSCA master list (and Active-Authentication re-verification, currently blocked
+/// upstream by `aa_signature` never being persisted in the reader result) — is a tracked follow-up.
+#[allow(clippy::too_many_lines)]
+fn verify_emrtd_evidence(
+    evidence: &EmrtdEvidenceObject,
+    trusted_reader_key: &[u8],
+    issuer: &Url,
+    expected_nonce: &str,
+    expected_new_holder_jkt: &str,
+    now: u64,
+) -> Result<VerifiedChipLiveness, (StatusCode, Json<OAuthError>)> {
+    if evidence.attestation.len() > MAX_EMRTD_EVIDENCE_BYTES {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence attestation exceeds the accepted size",
+        ));
+    }
+    let key = VerifyingKey::from_sec1_bytes(trusted_reader_key).map_err(|_| {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "configured `eMRTD` reader key is malformed",
+        )
+    })?;
+    let payload = verify_jws_payload(&evidence.attestation, &key, "`eMRTD` evidence")?;
+    let claims: EmrtdEvidenceClaims = serde_json::from_value(payload).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence attestation is missing required claims",
+        )
+    })?;
+
+    // Audience + freshness: the attestation must be for THIS issuer and inside its validity window.
+    if claims.aud.trim_end_matches('/') != issuer.as_str().trim_end_matches('/')
+        || claims.iat > now
+        || now >= claims.exp
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence audience or validity interval is not accepted",
+        ));
+    }
+    // Session + wallet binding (constant-time): the attestation is welded to this credential-proof
+    // nonce and to the wallet holder key that will hold the PID — it cannot be replayed into another
+    // session or bound to a different device.
+    if claims
+        .nonce
+        .as_bytes()
+        .ct_eq(expected_nonce.as_bytes())
+        .unwrap_u8()
+        != 1
+        || claims
+            .new_holder_jkt
+            .as_bytes()
+            .ct_eq(expected_new_holder_jkt.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence is not bound to this session and holder key",
+        ));
+    }
+    // Liveness quality policy: only a genuine-presence `iProov` capture is accepted (the kernel gate
+    // separately requires the portrait match itself).
+    if !claims.liveness.assurance.contains(EMRTD_REQUIRED_LIVENESS) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence lacks the required genuine-presence liveness assurance",
+        ));
+    }
+    // A PID must not be minted from an expired travel document (the reader does not enforce this).
+    if is_expired_document(&claims.mrz.date_of_expiry, now) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "the read travel document is expired",
+        ));
+    }
+    // DG1 identity must be present and bounded (mirrors the Svipe proofing normaliser).
+    for value in [
+        &claims.mrz.family_name,
+        &claims.mrz.given_name,
+        &claims.mrz.birthdate,
+        &claims.mrz.nationality,
+        &claims.mrz.issuing_country,
+        &claims.mrz.document_number,
+    ] {
+        if value.trim().is_empty() || value.len() > 512 {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "`eMRTD` evidence identity claim is missing or oversized",
+            ));
+        }
+    }
+    let portrait = match claims.portrait {
+        Some(portrait) if portrait.len() > MAX_EMRTD_EVIDENCE_BYTES => {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "`eMRTD` portrait exceeds the accepted size",
+            ));
+        }
+        Some(portrait) if portrait.trim().is_empty() => None,
+        other => other,
+    };
+
+    // Stable subject derived from the document identity (issuing state + document number).
+    let subject = SubjectId(hash_u128(&format!(
+        "emrtd:{}:{}",
+        claims.mrz.issuing_country, claims.mrz.document_number
+    )));
+    let age_over_18 = age_over_18(&claims.mrz.birthdate, now);
+    Ok(VerifiedChipLiveness {
+        subject,
+        jti: claims.jti,
+        // Pass the reader's reproduced verdicts THROUGH to the kernel gate — the kernel, not this
+        // endpoint, is the authoritative allow/deny (proved in `EudiIssuer.Model`).
+        sod_passive_auth: claims.passive_authentication,
+        chip_authentic: claims.chip_authentic,
+        liveness_matched: claims.liveness.matched_portrait,
+        claims: PidSubjectClaims {
+            family_name: claims.mrz.family_name,
+            given_name: claims.mrz.given_name,
+            birthdate: claims.mrz.birthdate,
+            nationality: claims.mrz.nationality,
+            issuing_country: claims.mrz.issuing_country,
+            age_over_18,
+            portrait,
+        },
+    })
+}
+
+/// True when an ISO `YYYY-MM-DD` expiry date is strictly before today's date at `now`.
+fn is_expired_document(expiry_iso: &str, now: u64) -> bool {
+    let parts: Vec<&str> = expiry_iso.split('-').collect();
+    let (Ok(year), Ok(month), Ok(day)) = (
+        parts.first().copied().unwrap_or_default().parse::<i32>(),
+        parts.get(1).copied().unwrap_or_default().parse::<u8>(),
+        parts.get(2).copied().unwrap_or_default().parse::<u8>(),
+    ) else {
+        // Unparseable expiry → treat as expired (fail-closed).
+        return true;
+    };
+    let Ok(seconds) = i64::try_from(now) else {
+        return true;
+    };
+    let Ok(today) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return true;
+    };
+    (year, month, day) < (today.year(), u8::from(today.month()), today.day())
+}
+
 fn verify_jws_payload(
     compact: &str,
     key: &VerifyingKey,
@@ -1980,10 +2351,11 @@ fn authorize_kernel(
     holder_jkt: &str,
     nonce: &str,
     pid_subject: Option<SubjectId>,
+    chip_liveness: Option<&VerifiedChipLiveness>,
     now: u64,
 ) -> Result<Option<MandateGrant>, (StatusCode, Json<OAuthError>)> {
     let role = match profile_name {
-        PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
+        PID_SD_JWT | PID_FROM_EMRTD_SD_JWT | PID_MDOC => IssuerRole::Pid,
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
         TLSN_EVIDENCE_SD_JWT | HYBRID_PQ_SD_JWT => IssuerRole::DevelopmentEvidence,
@@ -1998,6 +2370,7 @@ fn authorize_kernel(
     };
     let format = match profile_name {
         PID_SD_JWT
+        | PID_FROM_EMRTD_SD_JWT
         | QEAA_SD_JWT
         | QEAA_PID_BOUND_SD_JWT
         | DEV_SVIPE_PID_SD_JWT
@@ -2019,7 +2392,19 @@ fn authorize_kernel(
             "PID-bound issuance has no verified PID subject",
         ));
     }
-    let subject = pid_subject.unwrap_or_else(|| SubjectId(hash_u128("demo-education-subject")));
+    if profile_name == PID_FROM_EMRTD_SD_JWT && chip_liveness.is_none() {
+        return Err(oauth_error(
+            StatusCode::FORBIDDEN,
+            "credential_request_denied",
+            "NFC-sourced PID issuance has no verified chip + liveness evidence",
+        ));
+    }
+    // The NFC-sourced PID's subject is the identity the chip read established; other flows fall back
+    // to the presented-PID subject (or the demo subject).
+    let subject = chip_liveness
+        .map(|c| c.subject)
+        .or(pid_subject)
+        .unwrap_or_else(|| SubjectId(hash_u128("demo-education-subject")));
     let dataset = DatasetId(hash_u128(profile_name));
     let evidence = Evidence {
         valid_from: Instant(now.saturating_sub(1)),
@@ -2047,6 +2432,9 @@ fn authorize_kernel(
         // require_hybrid_pq, which no profile on this ES256 path does. A post-quantum mandate would
         // set it and route through the hybrid signer; that wire is a tracked follow-up.
         require_hybrid_pq: false,
+        // The NFC-sourced PID profile is the one that opts into the (Lean-proved) chip+liveness
+        // gate; every other profile proofs the subject a different way and leaves it un-required.
+        require_chip_liveness: profile_name == PID_FROM_EMRTD_SD_JWT,
     };
     let proof = CredentialProof {
         evidence,
@@ -2087,7 +2475,15 @@ fn authorize_kernel(
         subject: SubjectEvidence {
             evidence,
             subject,
-            loa_high: true,
+            // For the NFC-sourced PID, LoA-high is EARNED from the verified chip + liveness evidence
+            // (Passive Auth + anti-cloning + portrait-matched liveness), not asserted; other
+            // development profiles keep the demo assertion.
+            loa_high: if profile_name == PID_FROM_EMRTD_SD_JWT {
+                chip_liveness
+                    .is_some_and(|c| c.sod_passive_auth && c.chip_authentic && c.liveness_matched)
+            } else {
+                true
+            },
             entitled: true,
             claims_current: true,
             dataset,
@@ -2101,6 +2497,15 @@ fn authorize_kernel(
         wia_ka_maintenance_end: Instant(now.saturating_add(86_400)),
         hybrid_pq_bound: false,
         delegation: mandate_context.map(|(delegation, _)| delegation),
+        // The verified `eMRTD` chip + liveness verdicts, passed THROUGH to the kernel gate — the
+        // kernel (not the endpoint) makes the authoritative allow/deny on these.
+        chip_evidence: chip_liveness.map(|c| ChipLivenessEvidence {
+            evidence,
+            subject: c.subject,
+            sod_passive_auth: c.sod_passive_auth,
+            chip_authentic: c.chip_authentic,
+            liveness_matched: c.liveness_matched,
+        }),
     };
     let command = authorize_sign(session, request, Instant(now)).map_err(|_| {
         oauth_error(
@@ -2229,6 +2634,7 @@ fn issue_sd_jwt(
     holder_jwk: &Value,
     now: u64,
     tlsn_evidence: Option<&VerifiedTlsnEvidence>,
+    pid_claims: Option<&PidSubjectClaims>,
 ) -> Result<String, (StatusCode, Json<OAuthError>)> {
     let (vct, claims) = match profile {
         PID_SD_JWT | DEV_SVIPE_PID_SD_JWT => (
@@ -2241,6 +2647,22 @@ fn issue_sd_jwt(
                 ("issuing_country", json!("DE")),
             ],
         ),
+        PID_FROM_EMRTD_SD_JWT => {
+            // Real DG1 (MRZ) identity from the verified chip read — not the demo constants.
+            let pid = pid_claims.expect("NFC-sourced PID checked chip + liveness evidence");
+            let mut claims = vec![
+                ("family_name", json!(pid.family_name)),
+                ("given_name", json!(pid.given_name)),
+                ("birthdate", json!(pid.birthdate)),
+                ("age_over_18", json!(pid.age_over_18)),
+                ("nationality", json!(pid.nationality)),
+                ("issuing_country", json!(pid.issuing_country)),
+            ];
+            if let Some(portrait) = &pid.portrait {
+                claims.push(("portrait", json!(portrait)));
+            }
+            ("eu.europa.ec.eudi.pid.1", claims)
+        }
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT => (
             "urn:eu.europa.ec.eudi:learning:credential:1",
             vec![
@@ -3156,6 +3578,213 @@ mod tests {
         let input = format!("{header}.{payload}");
         let signature: Signature = key.sign(input.as_bytes());
         format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn emrtd_evidence_payload(issuer: &str, nonce: &str, holder_jkt: &str, now: u64) -> Value {
+        json!({
+            "aud": issuer,
+            "iat": now,
+            "exp": now + 300,
+            "nonce": nonce,
+            "jti": "emrtd-jti-1",
+            "new_holder_jkt": holder_jkt,
+            "passive_authentication": true,
+            "chip_authentic": true,
+            "liveness": {"assurance": "face_present:iproov:gpa", "matched_portrait": true},
+            "mrz": {
+                "family_name": "Mustermann",
+                "given_name": "Erika",
+                "birthdate": "1984-01-26",
+                "nationality": "DEU",
+                "issuing_country": "DEU",
+                "document_number": "C01X00T47",
+                "date_of_expiry": "2035-08-01"
+            },
+            "portrait": "data:image/jpeg;base64,AA=="
+        })
+    }
+
+    fn emrtd_evidence(reader: &SigningKey, payload: &Value) -> EmrtdEvidenceObject {
+        EmrtdEvidenceObject {
+            attestation: signed_jwt(reader, &json!({"alg": "ES256", "typ": "JWT"}), payload),
+        }
+    }
+
+    #[test]
+    fn emrtd_evidence_verifies_authenticity_binding_and_identity() {
+        let now = unix_time().expect("clock");
+        let issuer = Url::parse("http://127.0.0.1:18080").expect("issuer");
+        let reader = SigningKey::from_slice(&[11; 32]).expect("reader key");
+        let trusted = reader
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let nonce = "nfc-nonce-1";
+        let holder = "holder-jkt-1";
+        let payload = emrtd_evidence_payload(issuer.as_str(), nonce, holder, now);
+
+        let verified = verify_emrtd_evidence(
+            &emrtd_evidence(&reader, &payload),
+            &trusted,
+            &issuer,
+            nonce,
+            holder,
+            now,
+        )
+        .expect("valid attestation");
+        assert!(verified.sod_passive_auth && verified.chip_authentic && verified.liveness_matched);
+        assert_eq!(verified.claims.family_name, "Mustermann");
+        assert_eq!(verified.claims.nationality, "DEU");
+        assert!(verified.claims.age_over_18);
+        assert!(verified.claims.portrait.is_some());
+
+        // The subject is a stable function of the document identity.
+        let again = verify_emrtd_evidence(
+            &emrtd_evidence(&reader, &payload),
+            &trusted,
+            &issuer,
+            nonce,
+            holder,
+            now,
+        )
+        .expect("valid attestation");
+        assert_eq!(verified.subject, again.subject);
+
+        // Wrong signer, wrong session nonce, and wrong holder key are all rejected.
+        let wrong = SigningKey::from_slice(&[12; 32]).expect("other key");
+        assert!(
+            verify_emrtd_evidence(
+                &emrtd_evidence(&wrong, &payload),
+                &trusted,
+                &issuer,
+                nonce,
+                holder,
+                now
+            )
+            .is_err()
+        );
+        assert!(
+            verify_emrtd_evidence(
+                &emrtd_evidence(&reader, &payload),
+                &trusted,
+                &issuer,
+                "other",
+                holder,
+                now
+            )
+            .is_err()
+        );
+        assert!(
+            verify_emrtd_evidence(
+                &emrtd_evidence(&reader, &payload),
+                &trusted,
+                &issuer,
+                nonce,
+                "other",
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn emrtd_evidence_rejects_expired_document_and_weak_liveness() {
+        let now = unix_time().expect("clock");
+        let issuer = Url::parse("http://127.0.0.1:18080").expect("issuer");
+        let reader = SigningKey::from_slice(&[11; 32]).expect("reader key");
+        let trusted = reader
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let (nonce, holder) = ("nfc-nonce-1", "holder-jkt-1");
+
+        let mut expired = emrtd_evidence_payload(issuer.as_str(), nonce, holder, now);
+        expired["mrz"]["date_of_expiry"] = json!("2001-01-01");
+        assert!(
+            verify_emrtd_evidence(
+                &emrtd_evidence(&reader, &expired),
+                &trusted,
+                &issuer,
+                nonce,
+                holder,
+                now
+            )
+            .is_err()
+        );
+
+        let mut weak = emrtd_evidence_payload(issuer.as_str(), nonce, holder, now);
+        weak["liveness"]["assurance"] = json!("selfie:basic");
+        assert!(
+            verify_emrtd_evidence(
+                &emrtd_evidence(&reader, &weak),
+                &trusted,
+                &issuer,
+                nonce,
+                holder,
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nfc_pid_kernel_gate_denies_unverified_chip_but_allows_verified() {
+        let now = unix_time().expect("clock");
+        let issuer = Url::parse("http://127.0.0.1:18080").expect("issuer");
+        let reader = SigningKey::from_slice(&[11; 32]).expect("reader key");
+        let trusted = reader
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let (nonce, holder) = ("nfc-nonce-1", "holder-jkt-1");
+
+        // A fully verified chip read passes the (Lean-proved) kernel gate.
+        let ok = verify_emrtd_evidence(
+            &emrtd_evidence(
+                &reader,
+                &emrtd_evidence_payload(issuer.as_str(), nonce, holder, now),
+            ),
+            &trusted,
+            &issuer,
+            nonce,
+            holder,
+            now,
+        )
+        .expect("valid attestation");
+        assert!(
+            authorize_kernel(PID_FROM_EMRTD_SD_JWT, holder, nonce, None, Some(&ok), now).is_ok()
+        );
+
+        // An authentic attestation whose reader could NOT complete Passive Authentication is passed
+        // through to the kernel, which refuses to mint — the endpoint is not the gate, the kernel is.
+        let mut no_pa = emrtd_evidence_payload(issuer.as_str(), nonce, holder, now);
+        no_pa["passive_authentication"] = json!(false);
+        let denied = verify_emrtd_evidence(
+            &emrtd_evidence(&reader, &no_pa),
+            &trusted,
+            &issuer,
+            nonce,
+            holder,
+            now,
+        )
+        .expect("attestation is still authentic");
+        assert!(
+            authorize_kernel(
+                PID_FROM_EMRTD_SD_JWT,
+                holder,
+                nonce,
+                None,
+                Some(&denied),
+                now
+            )
+            .is_err()
+        );
+
+        // No chip evidence at all → the NFC-sourced PID profile fails closed.
+        assert!(authorize_kernel(PID_FROM_EMRTD_SD_JWT, holder, nonce, None, None, now).is_err());
     }
 
     #[test]

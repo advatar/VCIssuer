@@ -125,6 +125,13 @@ pub struct CredentialProfile {
     /// signs ES256 and leaves this unset, so a post-quantum mandate is a profiled option (route
     /// through the hybrid signer), not yet the default.
     pub require_hybrid_pq: bool,
+    /// When set, issuance is gated on structured eMRTD chip + liveness evidence
+    /// (`Session::chip_evidence`), downgrade-closed exactly like `require_hybrid_pq`: a profile that
+    /// sets it (the NFC-sourced PID profile) can never be issued without a chip read whose Passive
+    /// Authentication verified against a trusted CSCA, whose anti-cloning proof held, and whose
+    /// holder liveness matched the chip portrait (proven by `may_issue`). PID profiles that proof
+    /// the subject some other way leave it unset and are unaffected.
+    pub require_chip_liveness: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +207,32 @@ pub struct Delegation {
     pub mandate_not_revoked: bool,
 }
 
+/// Structured evidence from an in-wallet eMRTD (ICAO 9303 passport / national eID) chip read,
+/// carried when issuing an NFC-sourced PID. Every boolean is a *verified verdict the issuer itself
+/// reproduced* over the raw data groups + EF.SOD delivered by the reader (HPKE-encrypted to the
+/// issuer), not a self-asserted flag from the wallet:
+///
+/// - `sod_passive_auth`: Passive Authentication succeeded — the EF.SOD CMS signature is valid, its
+///   Document Signer certificate chains to a CSCA in the issuer's own trust store, and every read
+///   data group's hash matches the LDS Security Object. This is what binds DG1 (MRZ) and DG2
+///   (portrait) to a genuine, unmodified chip.
+/// - `chip_authentic`: an anti-cloning proof held — Chip/Active Authentication or PACE-CAM — so the
+///   chip is the original, not a copied datagroup dump.
+/// - `liveness_matched`: a *fresh* holder liveness capture matched the DG2 portrait, binding the
+///   person presenting the wallet to the document that was read.
+///
+/// `subject` is the identity the read establishes; it must equal the request subject so the minted
+/// PID cannot be pointed at a different holder. `evidence` carries the read's validity/freshness
+/// window (a stale read is refused via `usable_at`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChipLivenessEvidence {
+    pub evidence: Evidence,
+    pub subject: SubjectId,
+    pub sod_passive_auth: bool,
+    pub chip_authentic: bool,
+    pub liveness_matched: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
     pub id: RequestId,
@@ -233,6 +266,9 @@ pub struct Session {
     /// Present iff the profile role is `Representation`; carries the authenticated delegator, the
     /// delegate (agent) key, and the delegator's live grant.
     pub delegation: Option<Delegation>,
+    /// Present when the issuer verified an eMRTD chip read + holder liveness for this session
+    /// (the NFC-sourced PID flow). Required — and checked — iff `profile.require_chip_liveness`.
+    pub chip_evidence: Option<ChipLivenessEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +326,26 @@ pub const fn representation_ok(session: Session, request: Request, now: Instant)
     }
 }
 
+/// Chip + liveness gate for an NFC-sourced PID issuance. Downgrade-closed like the hybrid-PQ gate:
+/// the `may_issue` conjunct only *invokes* this when `profile.require_chip_liveness` is set, and
+/// then it demands a chip-read evidence value that is fresh, Passive-Authenticated against a
+/// trusted CSCA, anti-clone proven, liveness-matched, and bound to the request subject. A profile
+/// that does not require chip liveness short-circuits before reaching here (vacuously satisfied).
+/// A required profile with no `chip_evidence` fails closed.
+#[must_use]
+pub const fn chip_liveness_ok(session: Session, request: Request, now: Instant) -> bool {
+    match session.chip_evidence {
+        Some(e) => {
+            e.evidence.usable_at(now)
+                && e.sod_passive_auth
+                && e.chip_authentic
+                && e.liveness_matched
+                && e.subject.0 == request.subject.0
+        }
+        None => false,
+    }
+}
+
 #[must_use]
 pub const fn device_binding_ok(
     profile: CredentialProfile,
@@ -342,6 +398,10 @@ pub const fn may_issue(session: Session, request: Request, now: Instant) -> bool
         && (!session.profile.require_hybrid_pq || session.hybrid_pq_bound)
         // Delegation: monotonic-narrowing power-of-representation gate.
         && representation_ok(session, request, now)
+        // NFC-sourced PID: when the profile requires it, a chip read with verified Passive
+        // Authentication, anti-cloning, and portrait-matched liveness must be present —
+        // downgrade-closed (a require_chip_liveness profile can never be issued without it).
+        && (!session.profile.require_chip_liveness || chip_liveness_ok(session, request, now))
 }
 
 /// The sole pure gateway to a credential signing command.
@@ -393,6 +453,7 @@ mod tests {
             device_binding_required: true,
             pid_binding_required: false,
             require_hybrid_pq: false,
+            require_chip_liveness: false,
         };
         let proof = CredentialProof {
             evidence: valid_evidence(),
@@ -446,7 +507,24 @@ mod tests {
             wia_ka_maintenance_end: Instant(160),
             hybrid_pq_bound: false,
             delegation: None,
+            chip_evidence: None,
         };
+        (session, request)
+    }
+
+    /// Turn the base fixture into an NFC-sourced PID issuance: the profile requires chip+liveness
+    /// evidence, and the session carries a verified chip read (Passive Auth held, chip authentic,
+    /// liveness matched) bound to the request subject (4). Valid by construction.
+    fn nfc_pid_fixture() -> (Session, Request) {
+        let (mut session, request) = fixture();
+        session.profile.require_chip_liveness = true;
+        session.chip_evidence = Some(ChipLivenessEvidence {
+            evidence: valid_evidence(),
+            subject: SubjectId(4),
+            sod_passive_auth: true,
+            chip_authentic: true,
+            liveness_matched: true,
+        });
         (session, request)
     }
 
@@ -540,6 +618,96 @@ mod tests {
             authorize_sign(session, request, NOW),
             Err(DecisionError::NotAuthorized)
         );
+    }
+
+    #[test]
+    fn nfc_pid_with_verified_chip_and_liveness_signs() {
+        let (session, request) = nfc_pid_fixture();
+        let cmd = authorize_sign(session, request, NOW).expect("valid NFC-sourced PID");
+        // A PID issuance carries no delegation powers.
+        assert_eq!(cmd.on_behalf_of, None);
+        assert_eq!(cmd.subject, SubjectId(4));
+    }
+
+    #[test]
+    fn nfc_pid_without_chip_evidence_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        session.chip_evidence = None; // profile requires it → downgrade-closed
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn nfc_pid_with_failed_passive_auth_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        if let Some(e) = session.chip_evidence.as_mut() {
+            e.sod_passive_auth = false; // SOD/CSCA chain or DG hashes did not verify
+        }
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn nfc_pid_from_a_cloned_chip_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        if let Some(e) = session.chip_evidence.as_mut() {
+            e.chip_authentic = false; // no Active/Chip Authentication / CAM anti-cloning proof
+        }
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn nfc_pid_without_liveness_match_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        if let Some(e) = session.chip_evidence.as_mut() {
+            e.liveness_matched = false; // holder liveness did not match the DG2 portrait
+        }
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn nfc_pid_chip_evidence_for_a_different_subject_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        if let Some(e) = session.chip_evidence.as_mut() {
+            e.subject = SubjectId(99); // chip established a different identity than requested
+        }
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn nfc_pid_with_stale_chip_read_is_refused() {
+        let (mut session, request) = nfc_pid_fixture();
+        if let Some(e) = session.chip_evidence.as_mut() {
+            // Read went stale before this issuance (fresh_until < now).
+            e.evidence.fresh_until = Instant(50);
+        }
+        assert_eq!(
+            authorize_sign(session, request, NOW),
+            Err(DecisionError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn chip_liveness_is_ignored_when_the_profile_does_not_require_it() {
+        // The base PID fixture does not require chip liveness and has no chip evidence, yet signs:
+        // the NFC gate is downgrade-closed only for profiles that opt in.
+        let (session, request) = fixture();
+        assert!(!session.profile.require_chip_liveness);
+        assert!(session.chip_evidence.is_none());
+        assert!(authorize_sign(session, request, NOW).is_ok());
     }
 
     #[test]

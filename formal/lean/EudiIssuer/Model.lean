@@ -50,6 +50,11 @@ structure CredentialProfile where
   /-- When set, issuance is gated on isolated hybrid-PQ evidence (`Session.hybridPqBound`); mandate
       attestations set this so delegated authority is post-quantum from day one. -/
   requireHybridPq : Bool
+  /-- When set, issuance is gated on structured eMRTD chip + liveness evidence
+      (`Session.chipEvidence`), downgrade-closed like `requireHybridPq`: the NFC-sourced PID profile
+      sets this so a PID can never be minted without a chip read whose Passive Authentication held,
+      whose anti-cloning proof held, and whose holder liveness matched the chip portrait. -/
+  requireChipLiveness : Bool
   deriving DecidableEq, Repr
 
 structure Evidence where
@@ -113,6 +118,22 @@ structure Delegation where
   mandateNotRevoked : Bool
   deriving DecidableEq, Repr
 
+/-- Structured evidence from an in-wallet eMRTD (passport / national eID) chip read, carried when
+    issuing an NFC-sourced PID (mirrors the Rust `ChipLivenessEvidence`). Each boolean is a verdict
+    the issuer itself reproduced over the raw data groups + EF.SOD the reader delivered:
+    `sodPassiveAuth` — Passive Authentication held (EF.SOD signed by a Document Signer chaining to a
+    trusted CSCA, every read DG's hash matches); `chipAuthentic` — an anti-cloning proof held
+    (Chip/Active Authentication or PACE-CAM); `livenessMatched` — a fresh holder liveness capture
+    matched the DG2 portrait. `subject` is the identity the read establishes and must equal the
+    request subject. -/
+structure ChipLivenessEvidence where
+  evidence : Evidence
+  subject : SubjectId
+  sodPassiveAuth : Bool
+  chipAuthentic : Bool
+  livenessMatched : Bool
+  deriving DecidableEq, Repr
+
 structure Request where
   id : RequestId
   profile : ProfileId
@@ -144,6 +165,9 @@ structure Session where
   /-- Present iff the profile role is `representation`; carries the authenticated delegator, the
       delegate (agent) key, and the delegator's live grant. -/
   delegation : Option Delegation
+  /-- Present when the issuer verified an eMRTD chip read + holder liveness for this session (the
+      NFC-sourced PID flow). Required — and checked — iff `profile.requireChipLiveness`. -/
+  chipEvidence : Option ChipLivenessEvidence
   deriving DecidableEq, Repr
 
 /-- Role-dependent subject proofing requirement. -/
@@ -180,6 +204,21 @@ def representationOk (s : Session) (r : Request) (now : Instant) : Prop :=
     | none => False
   | _ => True
 
+/-- Chip + liveness gate for an NFC-sourced PID issuance (mirrors the Rust `chip_liveness_ok`).
+    Downgrade-closed like the hybrid-PQ gate: the `mayIssue` conjunct only *invokes* this when
+    `profile.requireChipLiveness` is set, and then it demands a chip-read evidence value that is
+    fresh, Passive-Authenticated against a trusted CSCA, anti-clone proven, liveness-matched, and
+    bound to the request subject. A required profile with no `chipEvidence` fails closed. -/
+def chipLivenessOk (s : Session) (r : Request) (_now : Instant) : Prop :=
+  match s.chipEvidence with
+  | some e =>
+    e.evidence.usableAt _now ∧
+    e.sodPassiveAuth = true ∧
+    e.chipAuthentic = true ∧
+    e.livenessMatched = true ∧
+    e.subject = r.subject
+  | none => False
+
 /--
   Minimal executable authorization predicate. The production predicate must
   include every conjunct in FORMAL_SPEC.md and use structured proof evidence.
@@ -214,7 +253,10 @@ def mayIssue (s : Session) (r : Request) (now : Instant) : Prop :=
   -- present — downgrade-closed.
   (s.profile.requireHybridPq = false ∨ s.hybridPqBound = true) ∧
   -- Delegation: monotonic-narrowing power-of-representation gate.
-  representationOk s r now
+  representationOk s r now ∧
+  -- NFC-sourced PID: when the profile requires it, a chip read with verified Passive
+  -- Authentication, anti-cloning, and portrait-matched liveness must be present — downgrade-closed.
+  (s.profile.requireChipLiveness = false ∨ chipLivenessOk s r now)
 
 noncomputable instance mayIssueDecidable (s : Session) (r : Request) (now : Instant) :
     Decidable (mayIssue s r now) := Classical.propDecidable _
@@ -328,7 +370,7 @@ exceed the delegator's own authority, is bound to the delegate (agent) key, and 
 theorem mayIssue_representationOk (s : Session) (r : Request) (now : Instant)
     (h : mayIssue s r now) : representationOk s r now := by
   rcases h with
-    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hRep⟩
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hRep, _⟩
   exact hRep
 
 /-- `mayIssue` entails the post-quantum gate (the 26th conjunct). -/
@@ -405,6 +447,56 @@ theorem authorizeSign_requires_hybrid_pq_when_profile_requires
   rcases mayIssue_hybridPq s r now hMay with hFalse | hTrue
   · rw [hReq] at hFalse; simp at hFalse
   · exact hTrue
+
+/-! ## NFC-sourced PID (eMRTD chip + liveness) safety theorems
+
+These mirror the Rust `issuer-core` chip+liveness gate (`chip_liveness_ok` + the 28th `may_issue`
+conjunct). They establish that a successful NFC-sourced PID signing decision can never be produced
+without a chip read whose Passive Authentication verified, whose anti-cloning proof held, and whose
+holder liveness matched the chip portrait — bound to the request subject. -/
+
+/-- `mayIssue` entails the chip+liveness gate (the 28th conjunct). -/
+theorem mayIssue_chipLivenessOk (s : Session) (r : Request) (now : Instant)
+    (h : mayIssue s r now) :
+    s.profile.requireChipLiveness = false ∨ chipLivenessOk s r now := by
+  rcases h with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hChip⟩
+  exact hChip
+
+/-- When the profile requires it (the NFC-sourced PID profile does), a successful signing decision
+    proves the chip+liveness evidence was present and verified — downgrade-closed. -/
+theorem authorizeSign_requires_chip_liveness_when_profile_requires
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (hReq : s.profile.requireChipLiveness = true)
+    (h : authorizeSign s r now = .ok cmd) :
+    chipLivenessOk s r now := by
+  have hMay := authorizeSign_sound s r now cmd h
+  rcases mayIssue_chipLivenessOk s r now hMay with hFalse | hTrue
+  · rw [hReq] at hFalse; simp at hFalse
+  · exact hTrue
+
+/-- Headline NFC-PID-safety theorem: when the profile requires chip+liveness, a successful signing
+    decision proves a chip read was present whose Passive Authentication held, whose anti-cloning
+    proof held, whose holder liveness matched the DG2 portrait, and whose subject is exactly the
+    request subject — so a PID can never be minted from a forged, cloned, or mismatched chip read. -/
+theorem chip_liveness_pid_authorizeSign_binds_verified_chip
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (hReq : s.profile.requireChipLiveness = true)
+    (h : authorizeSign s r now = .ok cmd) :
+    ∃ e, s.chipEvidence = some e ∧
+      e.evidence.usableAt now ∧
+      e.sodPassiveAuth = true ∧
+      e.chipAuthentic = true ∧
+      e.livenessMatched = true ∧
+      e.subject = r.subject := by
+  have hChip := authorizeSign_requires_chip_liveness_when_profile_requires s r now cmd hReq h
+  cases hCE : s.chipEvidence with
+  | none =>
+    simp only [chipLivenessOk, hCE] at hChip
+  | some e =>
+    simp only [chipLivenessOk, hCE] at hChip
+    obtain ⟨hUsable, hPa, hAuth, hLive, hSubj⟩ := hChip
+    exact ⟨e, rfl, hUsable, hPa, hAuth, hLive, hSubj⟩
 
 /-! ## Experimental hybrid post-quantum issuance boundary
 
