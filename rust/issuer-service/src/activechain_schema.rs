@@ -1,4 +1,4 @@
-//! Cross-repository ActiveChain schema mapping for externally issued credentials.
+//! Cross-repository `ActiveChain` schema mapping for externally issued credentials.
 
 use sha3::{
     Shake256,
@@ -13,11 +13,14 @@ pub enum MappingError {
 }
 
 fn update_length_prefixed(hasher: &mut Shake256, value: &[u8]) {
-    hasher.update(&(value.len() as u32).to_be_bytes());
+    // Every caller bounds `value` by `MAX_IDENTIFIER_BYTES` (or a fixed 48-byte digest), so the
+    // length always fits in a u32; the pinned golden vectors below confirm the byte layout.
+    let len = u32::try_from(value.len()).expect("length-prefixed value fits in u32");
+    hasher.update(&len.to_be_bytes());
     hasher.update(value);
 }
 
-/// Mirrors ActiveChain P-096 exactly. The result is selected from a pinned table; it is never
+/// Mirrors `ActiveChain` P-096 exactly. The result is selected from a pinned table; it is never
 /// accepted from an issuance or presentation request.
 pub fn derive_schema_id(
     configuration: &[u8],

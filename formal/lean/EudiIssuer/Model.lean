@@ -18,11 +18,22 @@ abbrev NonceId := Nat
 abbrev RequestId := Nat
 abbrev DatasetId := Nat
 
+/-- A bounded set of authorized operations as a bitmask (mirrors the Rust `Powers(u64)`), keeping
+    the scope-containment relation decidable so the Lean model can mirror it exactly. -/
+abbrev Powers := Nat
+
+/-- `a ⊆ grant`: every set bit of `a` is also set in `grant` — monotonic narrowing. Mirrors the
+    Rust `Powers::subset_of` (`(self.0 & grant.0) == self.0`). -/
+def Powers.subsetOf (a grant : Powers) : Prop := Nat.land a grant = a
+
 inductive IssuerRole where
   | pid
   | qeaa
   | publicBodyEaa
   | nonQualifiedEaa
+  /-- Power-of-representation / mandate attestation (ARF Topic 29): a delegator grants a delegate
+      (which MAY be an AI agent) a scoped, revocable authority. -/
+  | representation
   deriving DecidableEq, Repr
 
 inductive CredentialFormat where
@@ -36,6 +47,9 @@ structure CredentialProfile where
   format : CredentialFormat
   enabled : Bool
   deviceBindingRequired : Bool
+  /-- When set, issuance is gated on isolated hybrid-PQ evidence (`Session.hybridPqBound`); mandate
+      attestations set this so delegated authority is post-quantum from day one. -/
+  requireHybridPq : Bool
   deriving DecidableEq, Repr
 
 structure Evidence where
@@ -87,6 +101,18 @@ structure SubjectEvidence where
   dataset : DatasetId
   deriving DecidableEq, Repr
 
+/-- Delegation context for a power-of-representation issuance (mirrors the Rust `Delegation`). The
+    delegator is authenticated by their own presented attestation carried as `delegatorEvidence`;
+    `grant` is the authority the delegator actually holds; `delegateKey` is the key the resulting
+    mandate is bound to — the AI agent's holder key. -/
+structure Delegation where
+  delegatorEvidence : Evidence
+  delegator : SubjectId
+  delegateKey : KeyThumbprint
+  grant : Powers
+  mandateNotRevoked : Bool
+  deriving DecidableEq, Repr
+
 structure Request where
   id : RequestId
   profile : ProfileId
@@ -95,6 +121,9 @@ structure Request where
   dpopKey : KeyThumbprint
   proof : CredentialProof
   expiry : Instant
+  /-- Powers the mandate would authorize. Ignored unless the profile role is `representation`;
+      must be a non-empty subset of the delegator's `grant`. -/
+  requestedPowers : Powers
   deriving DecidableEq, Repr
 
 structure Session where
@@ -110,6 +139,11 @@ structure Session where
   statusReserved : Bool
   alreadyIssued : Bool
   wiaKaMaintenanceEnd : Instant
+  /-- Isolated hybrid-PQ evidence is present and accepted for this session (downgrade-closed). -/
+  hybridPqBound : Bool
+  /-- Present iff the profile role is `representation`; carries the authenticated delegator, the
+      delegate (agent) key, and the delegator's live grant. -/
+  delegation : Option Delegation
   deriving DecidableEq, Repr
 
 /-- Role-dependent subject proofing requirement. -/
@@ -127,6 +161,24 @@ def deviceBindingOk (profile : CredentialProfile) (wallet : WalletEvidence)
     wallet.ka.isSome = true
   else
     proof.possessionValid = true
+
+/-- Delegation gate for power-of-representation issuance (mirrors the Rust `representation_ok`).
+    For a non-`representation` role this is vacuously `True`. For `representation` it requires a
+    live authenticated delegator, a mandate bound to the delegate (agent) key that proved
+    possession, and a NON-EMPTY set of requested powers that is a SUBSET of the delegator's own
+    grant (monotonic narrowing — a delegate can never be granted authority the delegator lacked). -/
+def representationOk (s : Session) (r : Request) (now : Instant) : Prop :=
+  match s.profile.role with
+  | .representation =>
+    match s.delegation with
+    | some d =>
+      d.delegatorEvidence.usableAt now ∧
+      d.mandateNotRevoked = true ∧
+      d.delegateKey = r.proof.holderKey ∧
+      r.requestedPowers ≠ 0 ∧
+      Powers.subsetOf r.requestedPowers d.grant
+    | none => False
+  | _ => True
 
 /--
   Minimal executable authorization predicate. The production predicate must
@@ -157,7 +209,12 @@ def mayIssue (s : Session) (r : Request) (now : Instant) : Prop :=
   roleEvidenceOk s.profile.role s.subject ∧
   r.expiry ≤ s.wiaKaMaintenanceEnd ∧
   s.statusReserved = true ∧
-  s.alreadyIssued = false
+  s.alreadyIssued = false ∧
+  -- Post-quantum: when the profile requires it (mandates do), isolated hybrid-PQ evidence must be
+  -- present — downgrade-closed.
+  (s.profile.requireHybridPq = false ∨ s.hybridPqBound = true) ∧
+  -- Delegation: monotonic-narrowing power-of-representation gate.
+  representationOk s r now
 
 noncomputable instance mayIssueDecidable (s : Session) (r : Request) (now : Instant) :
     Decidable (mayIssue s r now) := Classical.propDecidable _
@@ -172,7 +229,23 @@ structure SignCommand where
   profile : ProfileId
   subject : SubjectId
   holderKey : KeyThumbprint
+  /-- For a `representation` mandate: the authenticated delegator the mandate acts on behalf of,
+      and the exact powers granted (already narrowed to a subset of the delegator's grant). -/
+  onBehalfOf : Option SubjectId
+  grantedPowers : Powers
   deriving DecidableEq, Repr
+
+/-- The delegator a `representation` mandate acts on behalf of (mirrors the Rust tuple match). -/
+def onBehalfOfFor (s : Session) : Option SubjectId :=
+  match s.profile.role, s.delegation with
+  | .representation, some d => some d.delegator
+  | _, _ => none
+
+/-- The powers a `representation` mandate grants (already narrowed); empty for non-delegation. -/
+def grantedPowersFor (s : Session) (r : Request) : Powers :=
+  match s.profile.role, s.delegation with
+  | .representation, some _ => r.requestedPowers
+  | _, _ => 0
 
 /-- The unique pure gateway to a credential signing command. -/
 noncomputable def authorizeSign (s : Session) (r : Request) (now : Instant) :
@@ -184,6 +257,8 @@ noncomputable def authorizeSign (s : Session) (r : Request) (now : Instant) :
       profile := r.profile
       subject := r.subject
       holderKey := r.proof.holderKey
+      onBehalfOf := onBehalfOfFor s
+      grantedPowers := grantedPowersFor s r
     }
   else
     .error .notAuthorized
@@ -218,7 +293,7 @@ theorem authorizeSign_security_gates
   have hMay := authorizeSign_sound s r now cmd h
   rcases hMay with
     ⟨hEnabled, _, _, _, _, _, _, _, _, _, hProofNonce, hNonceUnused,
-      hHolderBinding, _, _, _, _, _, _, _, _, _, _, hStatus, hNotIssued⟩
+      hHolderBinding, _, _, _, _, _, _, _, _, _, _, hStatus, hNotIssued, _, _⟩
   exact ⟨hEnabled, hProofNonce, hNonceUnused, hHolderBinding, hStatus, hNotIssued⟩
 
 /-- A successful PID signing decision always carries LoA-high subject evidence. -/
@@ -242,6 +317,94 @@ theorem authorizeSign_respects_wallet_maintenance_bound
   rcases hMay with
     ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hBound, _⟩
   exact hBound
+
+/-! ## Power-of-representation (delegation) safety theorems
+
+These mirror the Rust `issuer-core` delegation gate (`representation_ok` + the two `may_issue`
+conjuncts). They establish that a successful power-of-representation signing decision can never
+exceed the delegator's own authority, is bound to the delegate (agent) key, and is post-quantum. -/
+
+/-- `mayIssue` entails the delegation gate (the 27th conjunct). -/
+theorem mayIssue_representationOk (s : Session) (r : Request) (now : Instant)
+    (h : mayIssue s r now) : representationOk s r now := by
+  rcases h with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hRep⟩
+  exact hRep
+
+/-- `mayIssue` entails the post-quantum gate (the 26th conjunct). -/
+theorem mayIssue_hybridPq (s : Session) (r : Request) (now : Instant)
+    (h : mayIssue s r now) :
+    s.profile.requireHybridPq = false ∨ s.hybridPqBound = true := by
+  rcases h with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hPq, _⟩
+  exact hPq
+
+/-- On a successful `.ok`, the command's delegation fields are exactly the selector values. -/
+theorem authorizeSign_ok_fields
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (h : authorizeSign s r now = .ok cmd) :
+    cmd.onBehalfOf = onBehalfOfFor s ∧ cmd.grantedPowers = grantedPowersFor s r := by
+  unfold authorizeSign at h
+  split at h
+  next _ =>
+    injection h with hcmd
+    subst hcmd
+    exact ⟨rfl, rfl⟩
+  next _ => cases h
+
+/-- Headline delegation-safety theorem: a successful power-of-representation signing decision can
+    never grant a power the delegator did not hold (monotonic narrowing), is bound to the delegate
+    (agent) key that proved possession, requires a live un-revoked authenticated delegator and a
+    non-empty scope, and acts on behalf of exactly that delegator. -/
+theorem representation_authorizeSign_narrows_and_binds
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (hRole : s.profile.role = .representation)
+    (h : authorizeSign s r now = .ok cmd) :
+    ∃ d, s.delegation = some d ∧
+      d.delegatorEvidence.usableAt now ∧
+      d.mandateNotRevoked = true ∧
+      d.delegateKey = r.proof.holderKey ∧
+      r.requestedPowers ≠ 0 ∧
+      Powers.subsetOf r.requestedPowers d.grant ∧
+      cmd.onBehalfOf = some d.delegator ∧
+      cmd.grantedPowers = r.requestedPowers := by
+  have hMay := authorizeSign_sound s r now cmd h
+  have hRep := mayIssue_representationOk s r now hMay
+  have hFields := authorizeSign_ok_fields s r now cmd h
+  cases hDel : s.delegation with
+  | none =>
+    simp only [representationOk, hRole, hDel] at hRep
+  | some d =>
+    simp only [representationOk, hRole, hDel] at hRep
+    obtain ⟨hUsable, hRevoked, hKey, hNonEmpty, hSubset⟩ := hRep
+    refine ⟨d, rfl, hUsable, hRevoked, hKey, hNonEmpty, hSubset, ?_, ?_⟩
+    · rw [hFields.1]; simp [onBehalfOfFor, hRole, hDel]
+    · rw [hFields.2]; simp [grantedPowersFor, hRole, hDel]
+
+/-- A `representation` role with no delegation context can never sign. -/
+theorem representation_without_delegation_cannot_sign
+    (s : Session) (r : Request) (now : Instant)
+    (hRole : s.profile.role = .representation)
+    (hNoDel : s.delegation = none) :
+    authorizeSign s r now = .error .notAuthorized := by
+  have hNotMay : ¬ mayIssue s r now := by
+    intro hMay
+    have hRep := mayIssue_representationOk s r now hMay
+    simp only [representationOk, hRole, hNoDel] at hRep
+  unfold authorizeSign
+  rw [dif_neg hNotMay]
+
+/-- When the profile requires it (mandates do), a successful signing decision proves the isolated
+    hybrid post-quantum evidence was present — delegated authority is post-quantum from day one. -/
+theorem authorizeSign_requires_hybrid_pq_when_profile_requires
+    (s : Session) (r : Request) (now : Instant) (cmd : SignCommand)
+    (hReq : s.profile.requireHybridPq = true)
+    (h : authorizeSign s r now = .ok cmd) :
+    s.hybridPqBound = true := by
+  have hMay := authorizeSign_sound s r now cmd h
+  rcases mayIssue_hybridPq s r now hMay with hFalse | hTrue
+  · rw [hReq] at hFalse; simp at hFalse
+  · exact hTrue
 
 /-! ## Experimental hybrid post-quantum issuance boundary
 

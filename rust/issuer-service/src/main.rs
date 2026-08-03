@@ -31,8 +31,8 @@ use base64::{
 use ciborium::value::Value as CborValue;
 use issuer_core::{
     Authorization, CredentialFormat, CredentialProfile, CredentialProof, DatasetId, Evidence,
-    Instant, IssuerRole, KeyThumbprint, NonceId, ProfileId, Request, RequestId, Session, SessionId,
-    SubjectEvidence, SubjectId, TokenBinding, WalletEvidence, authorize_sign,
+    Instant, IssuerRole, KeyThumbprint, NonceId, Powers, ProfileId, Request, RequestId, Session,
+    SessionId, SubjectEvidence, SubjectId, TokenBinding, WalletEvidence, authorize_sign,
 };
 use p256::{
     EncodedPoint,
@@ -1922,6 +1922,9 @@ fn authorize_kernel(
         enabled: true,
         device_binding_required: true,
         pid_binding_required: profile_name == QEAA_PID_BOUND_SD_JWT,
+        // This service path issues ordinary (non-mandate) credentials, so it does not require the
+        // isolated hybrid-PQ evidence gate. Mandate issuance goes through a distinct encoder (D4).
+        require_hybrid_pq: false,
     };
     let proof = CredentialProof {
         evidence,
@@ -1937,6 +1940,8 @@ fn authorize_kernel(
         dpop_key: holder_key,
         proof,
         expiry: Instant(now.saturating_add(3600)),
+        // Ignored for non-`Representation` roles; empty here.
+        requested_powers: Powers(0),
     };
     let session = Session {
         id: SessionId(hash_u128(&random_token())),
@@ -1972,6 +1977,8 @@ fn authorize_kernel(
         status_reserved: true,
         already_issued: false,
         wia_ka_maintenance_end: Instant(now.saturating_add(86_400)),
+        hybrid_pq_bound: false,
+        delegation: None,
     };
     authorize_sign(session, request, Instant(now)).map_err(|_| {
         oauth_error(
