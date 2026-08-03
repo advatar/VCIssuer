@@ -119,9 +119,11 @@ pub struct CredentialProfile {
     pub enabled: bool,
     pub device_binding_required: bool,
     pub pid_binding_required: bool,
-    /// When set, issuance is gated on isolated hybrid-PQ evidence (`Session::hybrid_pq_bound`).
-    /// Mandate attestations set this so delegated authority is post-quantum from day one, even
-    /// though the EU Business Wallet does not yet require PQ.
+    /// When set, issuance is gated on isolated hybrid-PQ evidence (`Session::hybrid_pq_bound`),
+    /// downgrade-closed — the PQ *capability*: a profile that sets it can never be issued on
+    /// classical-only evidence (proven by `may_issue`). The current SD-JWT mandate service path
+    /// signs ES256 and leaves this unset, so a post-quantum mandate is a profiled option (route
+    /// through the hybrid signer), not yet the default.
     pub require_hybrid_pq: bool,
 }
 
@@ -325,6 +327,11 @@ pub const fn may_issue(session: Session, request: Request, now: Instant) -> bool
         && session.subject.dataset.0 == request.dataset.0
         && session.subject.entitled
         && session.subject.claims_current
+        // NOTE: this PID-binding conjunct (the delegator/PID-presentation authentication used by the
+        // mandate + PID-bound-QEAA flows) is an intentional Rust-ONLY guard. The Lean `mayIssue`
+        // abstracts the credential-binding + delegation decision and does NOT model the wallet's
+        // PID-presentation adapter step, so the Rust↔Lean correspondence is faithful on the modelled
+        // gates but is NOT a full 1:1 (Rust is strictly stricter here — fail-closed).
         && (!session.profile.pid_binding_required || session.subject.pid_binding_verified)
         && role_evidence_ok(session.profile.role, session.subject)
         && request.expiry.0 <= session.wia_ka_maintenance_end.0

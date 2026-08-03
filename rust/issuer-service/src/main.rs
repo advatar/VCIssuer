@@ -1241,7 +1241,7 @@ async fn credential(
         }
         _ => None,
     };
-    authorize_kernel(
+    let mandate_grant = authorize_kernel(
         &request.credential_configuration_id,
         &verified_proof.holder_jkt,
         &verified_proof.nonce,
@@ -1340,13 +1340,13 @@ async fn credential(
         MANDATE_SD_JWT => {
             #[cfg(target_os = "macos")]
             {
-                // The kernel (authorize_kernel → authorize_sign) has already proven this mandate
-                // narrows within the delegator's grant and is bound to the agent (holder) key.
-                let delegator = pid_binding
+                // Consume the kernel's PROVEN decision (on_behalf_of + granted_powers, already
+                // narrowed within the delegator's grant and bound to the agent holder key) — not a
+                // re-derived constant. See MandateGrant / authorize_kernel.
+                let grant = mandate_grant
                     .as_ref()
-                    .expect("mandate issuance required a verified delegator PID")
-                    .subject;
-                let mandator = format!("urn:eudi:subject:{:032x}", delegator.0);
+                    .expect("the representation kernel yields a mandate grant");
+                let mandator = format!("urn:eudi:subject:{:032x}", grant.on_behalf_of.0);
                 let mandate_jti = random_token();
                 let signer = state
                     .credential_signers
@@ -1357,7 +1357,7 @@ async fn credential(
                     &state.issuer,
                     &verified_proof.holder_jwk,
                     &mandator,
-                    Powers(DEMO_MANDATE_POWERS),
+                    grant.granted_powers,
                     &mandate_jti,
                     now,
                 )?;
@@ -1965,6 +1965,15 @@ fn demo_mandate_delegation(
     (delegation, Powers(DEMO_MANDATE_POWERS))
 }
 
+/// The proven output of a `Representation` (mandate) authorization: the delegator the mandate acts
+/// on behalf of and the exact granted powers, taken verbatim from the kernel's `SignCommand`. The
+/// encoder consumes THIS — never a re-derived constant — so the signed mandate is the proven
+/// decision.
+struct MandateGrant {
+    on_behalf_of: SubjectId,
+    granted_powers: Powers,
+}
+
 #[allow(clippy::too_many_lines)]
 fn authorize_kernel(
     profile_name: &str,
@@ -1972,7 +1981,7 @@ fn authorize_kernel(
     nonce: &str,
     pid_subject: Option<SubjectId>,
     now: u64,
-) -> Result<(), (StatusCode, Json<OAuthError>)> {
+) -> Result<Option<MandateGrant>, (StatusCode, Json<OAuthError>)> {
     let role = match profile_name {
         PID_SD_JWT | PID_MDOC => IssuerRole::Pid,
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
@@ -2033,8 +2042,10 @@ fn authorize_kernel(
         enabled: true,
         device_binding_required: true,
         pid_binding_required: profile_name == QEAA_PID_BOUND_SD_JWT,
-        // This service path issues ordinary (non-mandate) credentials, so it does not require the
-        // isolated hybrid-PQ evidence gate. Mandate issuance goes through a distinct encoder (D4).
+        // The ES256 SD-JWT path (including the current demo mandate) is not gated on isolated
+        // hybrid-PQ evidence — the kernel PROVES PQ enforcement only when a profile sets
+        // require_hybrid_pq, which no profile on this ES256 path does. A post-quantum mandate would
+        // set it and route through the hybrid signer; that wire is a tracked follow-up.
         require_hybrid_pq: false,
     };
     let proof = CredentialProof {
@@ -2091,14 +2102,20 @@ fn authorize_kernel(
         hybrid_pq_bound: false,
         delegation: mandate_context.map(|(delegation, _)| delegation),
     };
-    authorize_sign(session, request, Instant(now)).map_err(|_| {
+    let command = authorize_sign(session, request, Instant(now)).map_err(|_| {
         oauth_error(
             StatusCode::FORBIDDEN,
             "credential_request_denied",
             "verified issuer kernel denied the signing command",
         )
     })?;
-    Ok(())
+    // Thread the PROVEN decision out: for a Representation issuance the kernel set on_behalf_of +
+    // granted_powers (already narrowed within the delegator's grant). The encoder uses these, so the
+    // signed mandate is the kernel's output — not a coincidentally-equal hardcoded constant.
+    Ok(command.on_behalf_of.map(|delegator| MandateGrant {
+        on_behalf_of: delegator,
+        granted_powers: command.granted_powers,
+    }))
 }
 
 fn hash_u128(value: &str) -> u128 {
