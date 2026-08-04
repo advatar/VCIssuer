@@ -46,6 +46,8 @@ pub struct CaptureSession {
     /// The issued PID SD-JWT, once `status == Issued`.
     pub credential: Option<String>,
     pub expires_at: u64,
+    /// Optional APNs device token to notify when the PID is issued.
+    pub device_token: Option<String>,
 }
 
 /// Request to open a capture session: the target wallet presents its proof-of-possession public key
@@ -54,6 +56,9 @@ pub struct CaptureSession {
 #[serde(deny_unknown_fields)]
 pub struct CreateCaptureSessionRequest {
     pub holder_jwk: Value,
+    /// Optional APNs device token to notify when this session's PID is issued.
+    #[serde(default)]
+    pub device_token: Option<String>,
 }
 
 /// Response: what the target wallet displays as a QR (the companion invocation URL) plus the iProov

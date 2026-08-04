@@ -3,6 +3,8 @@
 mod activechain_schema;
 // Apple App Attest verification (register an app instance + verify assertions).
 mod app_attest;
+// Apple Push Notification service provider (token-based JWT over HTTP/2).
+mod apns;
 mod capture;
 mod env_file;
 mod hybrid_codec;
@@ -125,6 +127,8 @@ struct AppState {
     iproov: Option<iproov::IProovConfig>,
     /// Apple App Attest configuration. `None` disables the App Attest endpoints (fail closed).
     app_attest: Option<app_attest::AppAttestConfig>,
+    /// APNs provider configuration. `None` disables push (registration + sends are no-ops).
+    apns: Option<apns::ApnsConfig>,
     /// Shared client for server-to-server iProov calls.
     http: reqwest::Client,
     inner: Arc<Mutex<VolatileState>>,
@@ -153,6 +157,8 @@ struct VolatileState {
     app_attest_challenges: HashMap<String, u64>,
     /// Registered App Attest instances, keyed by the base64url keyId.
     app_attest_instances: HashMap<String, app_attest::RegisteredInstance>,
+    /// APNs device tokens, keyed by an opaque per-install id the app supplies.
+    apns_tokens: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -556,6 +562,7 @@ async fn main() {
         tlsn_demo_notary,
         iproov: iproov_config,
         app_attest: app_attest::AppAttestConfig::from_env(),
+        apns: apns::ApnsConfig::from_env(),
         http,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
@@ -634,6 +641,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/app-attest/challenge", post(app_attest_challenge))
         .route("/v1/app-attest/register", post(app_attest_register))
         .route("/v1/app-attest/assert", post(app_attest_assert))
+        .route("/v1/notifications/register", post(notifications_register))
         .route("/v1/pid-capture/session", post(create_pid_capture_session))
         .route("/v1/pid-capture/{id}", get(get_pid_capture_session))
         .route(
@@ -1347,6 +1355,7 @@ async fn create_pid_capture_session(
             status: capture::CaptureStatus::AwaitingEvidence,
             credential: None,
             expires_at,
+            device_token: request.device_token,
         },
     );
     Ok(Json(capture::CreateCaptureSessionResponse {
@@ -1551,7 +1560,24 @@ async fn submit_pid_capture_evidence(
         session.status = capture::CaptureStatus::Issued;
         session.credential = Some(credential.clone());
         session.iproov_token = None; // single-use
+        let notify_token = session.device_token.clone();
         drop(inner);
+        // Best-effort push that the PID is ready (status only, never credential data).
+        if let (Some(apns), Some(token)) = (state.apns.clone(), notify_token) {
+            let http = state.http.clone();
+            tokio::spawn(async move {
+                let payload = apns::alert_payload(
+                    "Your document is ready",
+                    "Your PID has been issued to your wallet.",
+                );
+                let push_now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                if let Err(error) = apns.send(&http, &token, &payload, push_now).await {
+                    tracing::warn!(%error, "APNs push for issued capture session failed");
+                }
+            });
+        }
         Ok(Json(json!({
             "status": "issued",
             "format": "dc+sd-jwt",
@@ -1576,6 +1602,47 @@ async fn submit_pid_capture_evidence(
 
 /// Maximum accepted size of a base64-decoded App Attest attestation object.
 const MAX_APP_ATTEST_BYTES: usize = 8 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationsRegisterRequest {
+    /// Opaque per-install id the app chooses (so a device can update its token).
+    installation_id: String,
+    /// APNs device token (hex).
+    device_token: String,
+}
+
+/// Register an APNs device token so `VCIssuer` can push to this install. No-op-configured ⇒ 501.
+async fn notifications_register(
+    State(state): State<AppState>,
+    Json(request): Json<NotificationsRegisterRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    if state.apns.is_none() {
+        return Err(oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_enabled",
+            "push notifications are not configured on this issuer",
+        ));
+    }
+    if request.installation_id.is_empty()
+        || request.installation_id.len() > 128
+        || request.device_token.is_empty()
+        || request.device_token.len() > 256
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "installation_id and device_token are required and bounded",
+        ));
+    }
+    state
+        .inner
+        .lock()
+        .await
+        .apns_tokens
+        .insert(request.installation_id, request.device_token);
+    Ok(Json(json!({ "registered": true })))
+}
 
 #[derive(Serialize)]
 struct AppAttestChallengeResponse {
