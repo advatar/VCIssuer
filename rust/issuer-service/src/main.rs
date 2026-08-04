@@ -1268,6 +1268,19 @@ async fn get_pid_capture_session(
         ));
     }
     let mut body = json!({ "status": session.status });
+    // While awaiting evidence, hand the companion (launched with only the session id from the QR)
+    // the capture parameters it needs: the attestation-binding nonce and the iProov launch params.
+    if session.status == capture::CaptureStatus::AwaitingEvidence {
+        let object = body.as_object_mut().expect("body is an object");
+        object.insert("nonce".into(), json!(session.nonce));
+        if let Some(token) = &session.iproov_token {
+            object.insert("iproov_token".into(), json!(token));
+        }
+        if let Some(cfg) = &state.iproov {
+            object.insert("iproov_streaming_url".into(), json!(cfg.streaming_url()));
+            object.insert("iproov_assurance_type".into(), json!(cfg.assurance_type()));
+        }
+    }
     if let Some(credential) = &session.credential {
         let object = body.as_object_mut().expect("body is an object");
         object.insert("format".into(), json!("dc+sd-jwt"));
