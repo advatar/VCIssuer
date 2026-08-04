@@ -91,11 +91,21 @@ const DEMO_MANDATE_POWERS: u64 = 0b11;
 const TLSN_ARTIFACT_VERSION: &str = "tlsn.notary-artifact.v1";
 const MAX_TLSN_ARTIFACT_BYTES: usize = 256 * 1024;
 const TLSN_EVIDENCE_LIFETIME_SECONDS: u64 = 300;
+/// Post-quantum algorithm a `TLSNotary` artifact's optional second signature uses. When a trusted PQ
+/// notary key is configured, the notary attestation is a HYBRID (ES256 + ML-DSA-65) over the same
+/// payload and the classical-only form is refused — downgrade-closed, so a transcript harvested
+/// today stays unforgeable against a future quantum adversary. Verifier-side; the notary emitting
+/// the ML-DSA component is the upstream half.
+const TLSN_ARTIFACT_PQ_ALGORITHM: &str = "ML-DSA-65";
 
 #[derive(Clone)]
 struct AppState {
     issuer: Url,
     trusted_notary_key: Vec<u8>,
+    /// Optional ML-DSA-65 public key (raw, 1952 bytes) of the trusted notary. When set, `TLSNotary`
+    /// artifacts MUST carry a valid post-quantum second signature (downgrade-closed hybrid); absent,
+    /// classical ES256-only artifacts are accepted (existing behaviour, unchanged).
+    trusted_notary_pq_key: Option<Vec<u8>>,
     /// SEC1 P-256 public key of the trusted `eMRTD`-reader / liveness backend that attests NFC PID
     /// evidence. `None` disables the NFC-sourced PID endpoint (the profile then fails closed).
     trusted_emrtd_reader_key: Option<Vec<u8>>,
@@ -192,6 +202,15 @@ struct SignedTlsnArtifact {
     algorithm: String,
     public_key: String,
     signature: String,
+    /// Optional post-quantum second signature over the SAME payload (a hybrid notary attestation).
+    /// All three are present together or all absent. When the issuer has a trusted PQ notary key
+    /// configured, these are REQUIRED (downgrade-closed) and verified in addition to ES256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_signature: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -403,6 +422,17 @@ async fn main() {
         hex::decode(trusted_notary_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
     VerifyingKey::from_sec1_bytes(&trusted_notary_key)
         .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
+    // Optional: the trusted notary's ML-DSA-65 public key. When set, TLSNotary artifacts must carry
+    // a valid post-quantum second signature (downgrade-closed hybrid); absent → ES256-only accepted.
+    let trusted_notary_pq_key = std::env::var("TLSN_TRUSTED_NOTARY_PQ_KEY").ok().map(|hex| {
+        let key = hex::decode(hex).expect("TLSN_TRUSTED_NOTARY_PQ_KEY must be valid hex");
+        assert_eq!(
+            key.len(),
+            pq_backend::PUBLIC_KEY_BYTES,
+            "TLSN_TRUSTED_NOTARY_PQ_KEY must be a raw ML-DSA-65 public key"
+        );
+        key
+    });
     // Optional: the trusted `eMRTD`-reader / liveness backend key that attests NFC PID evidence.
     // Absent → the NFC-sourced PID endpoint is disabled (fails closed) and existing deployments are
     // unaffected.
@@ -463,6 +493,7 @@ async fn main() {
     let app = app(AppState {
         issuer,
         trusted_notary_key,
+        trusted_notary_pq_key,
         trusted_emrtd_reader_key,
         hybrid_pq_enabled,
         inner: Arc::new(Mutex::new(VolatileState::default())),
@@ -1032,7 +1063,12 @@ async fn create_tlsn_evidence_offer(
     Json(request): Json<TlsnEvidenceOfferRequest>,
 ) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
     let now = unix_time()?;
-    let evidence = verify_tlsn_artifact(&request.artifact, &state.trusted_notary_key, now)?;
+    let evidence = verify_tlsn_artifact(
+        &request.artifact,
+        &state.trusted_notary_key,
+        state.trusted_notary_pq_key.as_deref(),
+        now,
+    )?;
     let id = Uuid::new_v4().to_string();
     let issuer_state = random_token();
     let expires_in = TLSN_EVIDENCE_LIFETIME_SECONDS;
@@ -2215,9 +2251,11 @@ fn unix_time() -> Result<u64, (StatusCode, Json<OAuthError>)> {
         })
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_tlsn_artifact(
     artifact: &SignedTlsnArtifact,
     trusted_key: &[u8],
+    trusted_pq_key: Option<&[u8]>,
     now: u64,
 ) -> Result<VerifiedTlsnEvidence, (StatusCode, Json<OAuthError>)> {
     if artifact.payload.version != TLSN_ARTIFACT_VERSION || artifact.algorithm != "ES256" {
@@ -2294,6 +2332,54 @@ fn verify_tlsn_artifact(
             "TLSNotary artifact signature verification failed",
         )
     })?;
+    // Post-quantum: when a trusted ML-DSA notary key is configured, the artifact MUST also carry a
+    // valid ML-DSA-65 signature over the SAME payload from that key — the hybrid is downgrade-closed,
+    // so stripping the PQ component (or presenting a classical-only artifact) is refused and the two
+    // signatures must BOTH verify. When no PQ key is configured the classical path is unchanged; any
+    // PQ fields are ignored because there is no trust anchor to check them against.
+    if let Some(pq_key) = trusted_pq_key {
+        if artifact.pq_algorithm.as_deref() != Some(TLSN_ARTIFACT_PQ_ALGORITHM) {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_evidence",
+                "a post-quantum notary signature is required but missing or of an unknown algorithm",
+            ));
+        }
+        let embedded_pq_key = URL_SAFE_NO_PAD
+            .decode(artifact.pq_public_key.as_deref().unwrap_or_default())
+            .map_err(|_| {
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_evidence",
+                    "TLSNotary post-quantum public key is malformed",
+                )
+            })?;
+        if embedded_pq_key.len() != pq_key.len()
+            || embedded_pq_key.as_slice().ct_eq(pq_key).unwrap_u8() != 1
+        {
+            return Err(oauth_error(
+                StatusCode::FORBIDDEN,
+                "invalid_evidence",
+                "TLSNotary artifact was not post-quantum signed by the configured notary",
+            ));
+        }
+        let pq_signature = URL_SAFE_NO_PAD
+            .decode(artifact.pq_signature.as_deref().unwrap_or_default())
+            .map_err(|_| {
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_evidence",
+                    "TLSNotary post-quantum signature is malformed",
+                )
+            })?;
+        pq_backend::verify_signature(pq_key, &message, &pq_signature).map_err(|_| {
+            oauth_error(
+                StatusCode::FORBIDDEN,
+                "invalid_evidence",
+                "TLSNotary post-quantum signature verification failed",
+            )
+        })?;
+    }
     Ok(VerifiedTlsnEvidence {
         session_id: artifact.payload.session_id.clone(),
         issued_at: artifact.payload.issued_at,
@@ -3449,7 +3535,23 @@ mod tests {
             public_key: URL_SAFE_NO_PAD
                 .encode(key.verifying_key().to_encoded_point(false).as_bytes()),
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            pq_algorithm: None,
+            pq_public_key: None,
+            pq_signature: None,
         }
+    }
+
+    /// Add a valid ML-DSA-65 second signature over the same payload → a hybrid notary attestation.
+    fn with_pq_signature(
+        mut artifact: SignedTlsnArtifact,
+        pq: &pq_backend::GeneratedKeyPair,
+    ) -> SignedTlsnArtifact {
+        let message = serde_json::to_vec(&artifact.payload).expect("payload serializes");
+        let sig = pq_backend::sign_once(&pq.secret_key, &message).expect("ml-dsa sign");
+        artifact.pq_algorithm = Some(TLSN_ARTIFACT_PQ_ALGORITHM.into());
+        artifact.pq_public_key = Some(URL_SAFE_NO_PAD.encode(&pq.public_key));
+        artifact.pq_signature = Some(URL_SAFE_NO_PAD.encode(&sig));
+        artifact
     }
 
     #[test]
@@ -3459,7 +3561,7 @@ mod tests {
         let trusted = key.verifying_key().to_encoded_point(false);
         let artifact = tlsn_artifact(&key, now);
         let verified =
-            verify_tlsn_artifact(&artifact, trusted.as_bytes(), now).expect("valid artifact");
+            verify_tlsn_artifact(&artifact, trusted.as_bytes(), None, now).expect("valid artifact");
         assert_eq!(verified.session_id, "tlsn-session-1");
 
         let wrong = SigningKey::from_slice(&[9; 32]).expect("other test key");
@@ -3467,6 +3569,7 @@ mod tests {
             verify_tlsn_artifact(
                 &artifact,
                 wrong.verifying_key().to_encoded_point(false).as_bytes(),
+                None,
                 now
             )
             .is_err()
@@ -3474,18 +3577,65 @@ mod tests {
 
         let mut tampered = artifact.clone();
         tampered.payload.verifier_output["status"] = json!(500);
-        assert!(verify_tlsn_artifact(&tampered, trusted.as_bytes(), now).is_err());
+        assert!(verify_tlsn_artifact(&tampered, trusted.as_bytes(), None, now).is_err());
         assert!(
             verify_tlsn_artifact(
                 &tlsn_artifact(&key, now - TLSN_EVIDENCE_LIFETIME_SECONDS - 1),
                 trusted.as_bytes(),
+                None,
                 now
             )
             .is_err()
         );
         assert!(
-            verify_tlsn_artifact(&tlsn_artifact(&key, now + 6), trusted.as_bytes(), now).is_err()
+            verify_tlsn_artifact(&tlsn_artifact(&key, now + 6), trusted.as_bytes(), None, now)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn tlsn_hybrid_notary_signature_is_downgrade_closed() {
+        let now = unix_time().expect("clock");
+        let es = SigningKey::from_slice(&[7; 32]).expect("test key");
+        let trusted = es.verifying_key().to_encoded_point(false);
+        let trusted_es = trusted.as_bytes();
+        let pq = pq_backend::generate().expect("ml-dsa keypair");
+
+        // A hybrid artifact (ES256 + ML-DSA over the same payload) verifies when PQ is required.
+        let hybrid = with_pq_signature(tlsn_artifact(&es, now), &pq);
+        verify_tlsn_artifact(&hybrid, trusted_es, Some(&pq.public_key), now)
+            .expect("valid hybrid artifact");
+
+        // Downgrade-closed: a classical-only artifact is REFUSED once a PQ notary key is configured.
+        let classical = tlsn_artifact(&es, now);
+        assert!(
+            verify_tlsn_artifact(&classical, trusted_es, Some(&pq.public_key), now).is_err(),
+            "classical-only must be refused when PQ is required"
+        );
+
+        // The PQ signature must be from the configured PQ notary key.
+        let other_pq = pq_backend::generate().expect("other ml-dsa keypair");
+        assert!(
+            verify_tlsn_artifact(&hybrid, trusted_es, Some(&other_pq.public_key), now).is_err(),
+            "PQ signature from the wrong notary key must be refused"
+        );
+
+        // Tampering the payload breaks BOTH signatures (the ES256 check fails first, but the PQ
+        // binding is over the same bytes).
+        let mut tampered = hybrid.clone();
+        tampered.payload.verifier_output["status"] = json!(500);
+        assert!(verify_tlsn_artifact(&tampered, trusted_es, Some(&pq.public_key), now).is_err());
+
+        // A forged/garbage PQ signature of the right length is rejected.
+        let mut forged = hybrid.clone();
+        forged.pq_signature = Some(URL_SAFE_NO_PAD.encode(vec![0_u8; pq_backend::SIGNATURE_BYTES]));
+        assert!(verify_tlsn_artifact(&forged, trusted_es, Some(&pq.public_key), now).is_err());
+
+        // Backward compatible: with no PQ key configured, the classical artifact still verifies and
+        // any PQ fields are simply ignored (there is no trust anchor for them).
+        verify_tlsn_artifact(&classical, trusted_es, None, now).expect("classical still ok w/o PQ");
+        verify_tlsn_artifact(&hybrid, trusted_es, None, now)
+            .expect("hybrid still ok w/o PQ key (PQ ignored)");
     }
 
     #[test]
