@@ -42,7 +42,7 @@ use issuer_core::{
 };
 use p256::{
     EncodedPoint,
-    ecdsa::{Signature, VerifyingKey, signature::Verifier},
+    ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier},
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,9 @@ struct AppState {
     /// artifacts MUST carry a valid post-quantum second signature (downgrade-closed hybrid); absent,
     /// classical ES256-only artifacts are accepted (existing behaviour, unchanged).
     trusted_notary_pq_key: Option<Vec<u8>>,
+    /// DEV ONLY: ephemeral in-memory notary signing key. `Some` iff `ENABLE_TLSN_DEMO` is set; it
+    /// signs demo web-evidence artifacts for `/dev/tlsnotary/demo-offer`. `None` in production.
+    tlsn_demo_notary: Option<SigningKey>,
     /// SEC1 P-256 public key of the trusted `eMRTD`-reader / liveness backend that attests NFC PID
     /// evidence. `None` disables the NFC-sourced PID endpoint (the profile then fails closed).
     trusted_emrtd_reader_key: Option<Vec<u8>>,
@@ -434,12 +437,32 @@ async fn main() {
 
     let issuer = env_file::var("ISSUER_URL").unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let issuer = Url::parse(&issuer).expect("ISSUER_URL must be an absolute URL");
-    let trusted_notary_key = env_file::var("TLSN_TRUSTED_NOTARY_KEY")
-        .expect("TLSN_TRUSTED_NOTARY_KEY must contain the hex SEC1 P-256 notary public key");
-    let trusted_notary_key =
-        hex::decode(trusted_notary_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
-    VerifyingKey::from_sec1_bytes(&trusted_notary_key)
-        .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
+    // DEV ONLY: when ENABLE_TLSN_DEMO is set, mint an ephemeral in-memory notary and trust it, so
+    // `/dev/tlsnotary/demo-offer` can produce genuine (self-signed) web-evidence offers end to end
+    // without a live notary/prover. Never enable in production. Otherwise the notary trust anchor is
+    // the operator's real public key from the environment.
+    let tlsn_demo_enabled = env_file::var("ENABLE_TLSN_DEMO")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let (trusted_notary_key, tlsn_demo_notary) = if tlsn_demo_enabled {
+        let signer = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let public_key = signer
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        tracing::warn!(
+            "DEV ONLY: ENABLE_TLSN_DEMO is set — trusting an ephemeral in-memory TLSNotary notary; \
+             /dev/tlsnotary/demo-offer will mint demo web-evidence offers. Never enable in production."
+        );
+        (public_key, Some(signer))
+    } else {
+        let hex_key = env_file::var("TLSN_TRUSTED_NOTARY_KEY")
+            .expect("TLSN_TRUSTED_NOTARY_KEY must contain the hex SEC1 P-256 notary public key");
+        let key = hex::decode(hex_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
+        VerifyingKey::from_sec1_bytes(&key)
+            .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
+        (key, None)
+    };
     // Optional: the trusted notary's ML-DSA-65 public key. When set, TLSNotary artifacts must carry
     // a valid post-quantum second signature (downgrade-closed hybrid); absent → ES256-only accepted.
     let trusted_notary_pq_key = env_file::var("TLSN_TRUSTED_NOTARY_PQ_KEY").map(|hex| {
@@ -522,6 +545,7 @@ async fn main() {
         trusted_notary_pq_key,
         trusted_emrtd_reader_key,
         hybrid_pq_enabled,
+        tlsn_demo_notary,
         iproov: iproov_config,
         http,
         inner: Arc::new(Mutex::new(VolatileState::default())),
@@ -592,6 +616,7 @@ fn app(state: AppState) -> Router {
             "/evidence-offers/tlsnotary",
             post(create_tlsn_evidence_offer),
         )
+        .route("/dev/tlsnotary/demo-offer", post(tlsn_demo_offer))
         .route("/credential-offer/{id}", get(get_credential_offer))
         .route(
             "/.well-known/apple-app-site-association",
@@ -1100,9 +1125,20 @@ async fn create_tlsn_evidence_offer(
     State(state): State<AppState>,
     Json(request): Json<TlsnEvidenceOfferRequest>,
 ) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
+    build_tlsn_offer(&state, &request.artifact).await.map(Json)
+}
+
+/// Shared `TLSNotary` offer pipeline: verify the notary artifact (freshness + pinned key + hybrid-PQ
+/// closure), reserve the session against replay, stash the verified evidence on a fresh offer, and
+/// return the `openid-credential-offer` deep link. Used by both the real evidence-offer endpoint and
+/// the dev demo endpoint, so both go through the SAME verification.
+async fn build_tlsn_offer(
+    state: &AppState,
+    artifact: &SignedTlsnArtifact,
+) -> Result<CreateOfferResponse, (StatusCode, Json<OAuthError>)> {
     let now = unix_time()?;
     let evidence = verify_tlsn_artifact(
-        &request.artifact,
+        artifact,
         &state.trusted_notary_key,
         state.trusted_notary_pq_key.as_deref(),
         now,
@@ -1132,11 +1168,71 @@ async fn create_tlsn_evidence_offer(
     deep_link
         .query_pairs_mut()
         .append_pair("credential_offer_uri", &credential_offer_uri);
-    Ok(Json(CreateOfferResponse {
+    Ok(CreateOfferResponse {
         credential_offer_uri,
         deep_link: deep_link.to_string(),
         expires_in,
-    }))
+    })
+}
+
+/// Optional body for the dev demo endpoint: which web fact to notarise (all fields optional).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsnDemoRequest {
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    claim: Option<Value>,
+}
+
+/// DEV ONLY (`ENABLE_TLSN_DEMO`): mint a genuine, self-signed `TLSNotary` web-evidence offer so the
+/// wallet's embedded-capture flow can complete a full round-trip without a live notary/prover. The
+/// ephemeral in-memory notary signs a fresh demo artifact, which then goes through the SAME
+/// `build_tlsn_offer` verification as a real one. Disabled → `501 Not Implemented`.
+async fn tlsn_demo_offer(
+    State(state): State<AppState>,
+    request: Option<Json<TlsnDemoRequest>>,
+) -> Result<Json<CreateOfferResponse>, (StatusCode, Json<OAuthError>)> {
+    let signer = state.tlsn_demo_notary.as_ref().ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_enabled",
+            "TLSNotary demo mode is disabled (set ENABLE_TLSN_DEMO on the issuer)",
+        )
+    })?;
+    let now = unix_time()?;
+    let request = request.map(|json| json.0);
+    let server_name = request
+        .as_ref()
+        .and_then(|r| r.server_name.clone())
+        .unwrap_or_else(|| "example.com".to_owned());
+    let claim = request
+        .and_then(|r| r.claim)
+        .unwrap_or_else(|| json!("demo web fact notarised by the development notary"));
+    let payload = TlsnArtifactPayload {
+        version: TLSN_ARTIFACT_VERSION.into(),
+        session_id: format!("demo-{}", random_token()),
+        issued_at: now,
+        verifier_output: json!({
+            "serverName": server_name,
+            "status": 200,
+            "claim": claim,
+            "demo": true,
+        }),
+    };
+    let message = serde_json::to_vec(&payload).expect("demo artifact payload serializes");
+    let signature: Signature = signer.sign(&message);
+    let artifact = SignedTlsnArtifact {
+        payload,
+        algorithm: "ES256".into(),
+        public_key: URL_SAFE_NO_PAD
+            .encode(signer.verifying_key().to_encoded_point(false).as_bytes()),
+        signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        pq_algorithm: None,
+        pq_public_key: None,
+        pq_signature: None,
+    };
+    build_tlsn_offer(&state, &artifact).await.map(Json)
 }
 
 async fn get_credential_offer(
@@ -3924,6 +4020,49 @@ mod tests {
         assert!(
             verify_tlsn_artifact(&tlsn_artifact(&key, now + 6), trusted.as_bytes(), None, now)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn tlsn_demo_artifact_verifies_against_ephemeral_notary() {
+        // Mirrors `tlsn_demo_offer`'s artifact construction: the ephemeral demo notary signs a fresh
+        // demo payload, and its own public key is the trust anchor (as `main()` sets in demo mode),
+        // so the artifact passes the SAME verification a real one does — the demo loop is genuine,
+        // not a bypass.
+        let now = unix_time().expect("clock");
+        let signer = SigningKey::from_slice(&[13; 32]).expect("demo notary key");
+        let trusted = signer.verifying_key().to_encoded_point(false);
+        let payload = TlsnArtifactPayload {
+            version: TLSN_ARTIFACT_VERSION.into(),
+            session_id: format!("demo-{}", "session123"),
+            issued_at: now,
+            verifier_output: json!({
+                "serverName": "example.com", "status": 200, "claim": "demo", "demo": true
+            }),
+        };
+        let signature: Signature = signer.sign(&serde_json::to_vec(&payload).expect("serializes"));
+        let artifact = SignedTlsnArtifact {
+            payload,
+            algorithm: "ES256".into(),
+            public_key: URL_SAFE_NO_PAD.encode(trusted.as_bytes()),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            pq_algorithm: None,
+            pq_public_key: None,
+            pq_signature: None,
+        };
+        let verified = verify_tlsn_artifact(&artifact, trusted.as_bytes(), None, now)
+            .expect("demo artifact must pass the real verification");
+        assert!(verified.session_id.starts_with("demo-"));
+        // A different trust anchor must reject it (the demo notary is not universally trusted).
+        let other = SigningKey::from_slice(&[14; 32]).expect("other key");
+        assert!(
+            verify_tlsn_artifact(
+                &artifact,
+                other.verifying_key().to_encoded_point(false).as_bytes(),
+                None,
+                now
+            )
+            .is_err()
         );
     }
 
