@@ -4,6 +4,10 @@ mod activechain_schema;
 mod hybrid_codec;
 #[cfg(target_os = "macos")]
 mod hybrid_signer;
+// iProov Service Provider client (GPA liveness). Staged like `svipe`: wired by the capture-session
+// backend; allow(dead_code) until then.
+#[allow(dead_code)]
+mod iproov;
 mod pq_backend;
 #[cfg(target_os = "macos")]
 mod signer;
