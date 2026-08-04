@@ -218,7 +218,6 @@ pub fn parse_validate_response(body: &str, required_assurance: &str) -> Result<b
 
 /// Mint a GPA verify token for a capture session (server-to-server). `user_id` is sanitised to a
 /// clean iProov identifier; the caller MUST reuse the same raw `user_id` at validate time.
-#[allow(dead_code)]
 pub async fn create_token(
     client: &reqwest::Client,
     cfg: &IProovConfig,
@@ -241,7 +240,6 @@ pub async fn create_token(
 }
 
 /// Validate a completed capture → the authoritative, downgrade-closed `liveness_matched` verdict.
-#[allow(dead_code)]
 pub async fn validate(
     client: &reqwest::Client,
     cfg: &IProovConfig,
@@ -328,12 +326,16 @@ mod tests {
         let gpa = ASSURANCE_GENUINE_PRESENCE;
         // Passed AND assurance confirms the required level.
         assert!(
-            parse_validate_response(r#"{"passed":true,"assurance_type":"genuine_presence"}"#, gpa)
-                .unwrap()
+            parse_validate_response(
+                r#"{"passed":true,"assurance_type":"genuine_presence"}"#,
+                gpa
+            )
+            .unwrap()
         );
         // Passed but at a WEAKER level ⇒ rejected.
         assert!(
-            !parse_validate_response(r#"{"passed":true,"assurance_type":"liveness"}"#, gpa).unwrap()
+            !parse_validate_response(r#"{"passed":true,"assurance_type":"liveness"}"#, gpa)
+                .unwrap()
         );
         // Passed but assurance ABSENT ⇒ not evidence the level was achieved ⇒ rejected.
         assert!(!parse_validate_response(r#"{"passed":true}"#, gpa).unwrap());

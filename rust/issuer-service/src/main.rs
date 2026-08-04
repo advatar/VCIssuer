@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod activechain_schema;
+mod capture;
 mod hybrid_codec;
 #[cfg(target_os = "macos")]
 mod hybrid_signer;
-// iProov Service Provider client (GPA liveness). Staged like `svipe`: wired by the capture-session
-// backend; allow(dead_code) until then.
-#[allow(dead_code)]
+// iProov Service Provider client (GPA liveness) — the authoritative liveness verdict for the
+// cross-wallet PID capture flow.
 mod iproov;
 mod pq_backend;
 #[cfg(target_os = "macos")]
@@ -114,6 +114,11 @@ struct AppState {
     /// evidence. `None` disables the NFC-sourced PID endpoint (the profile then fails closed).
     trusted_emrtd_reader_key: Option<Vec<u8>>,
     hybrid_pq_enabled: bool,
+    /// iProov Service-Provider configuration for the cross-wallet PID capture flow. `None` disables
+    /// capture-session issuance (liveness cannot be validated ⇒ fail closed).
+    iproov: Option<iproov::IProovConfig>,
+    /// Shared client for server-to-server iProov calls.
+    http: reqwest::Client,
     inner: Arc<Mutex<VolatileState>>,
     #[cfg(target_os = "macos")]
     metadata_signer: Arc<KeychainSigner>,
@@ -135,6 +140,7 @@ struct VolatileState {
     binding_jtis: HashSet<String>,
     offers: HashMap<String, CredentialOffer>,
     tlsn_sessions: HashSet<String>,
+    capture_sessions: HashMap<String, capture::CaptureSession>,
 }
 
 #[derive(Clone)]
@@ -413,6 +419,7 @@ struct OAuthError {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -452,6 +459,14 @@ async fn main() {
         .expect("LISTEN_ADDR must be a socket address");
     let hybrid_pq_enabled = std::env::var("ENABLE_EXPERIMENTAL_HYBRID_PQ")
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    // iProov Service-Provider credentials (same MANDAMUS_IPROOV_* the Web/iOS SDKs use). Absent ⇒
+    // the cross-wallet PID capture flow is disabled and fails closed. Log only whether it is set.
+    let iproov_config = iproov::IProovConfig::from_env();
+    info!(
+        iproov_configured = iproov_config.is_some(),
+        "iProov Service-Provider configuration loaded"
+    );
+    let http = reqwest::Client::new();
 
     #[cfg(target_os = "macos")]
     let credential_signers = [
@@ -500,6 +515,8 @@ async fn main() {
         trusted_notary_pq_key,
         trusted_emrtd_reader_key,
         hybrid_pq_enabled,
+        iproov: iproov_config,
+        http,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
         metadata_signer: Arc::new(
@@ -569,6 +586,16 @@ fn app(state: AppState) -> Router {
             post(create_tlsn_evidence_offer),
         )
         .route("/credential-offer/{id}", get(get_credential_offer))
+        .route(
+            "/.well-known/apple-app-site-association",
+            get(apple_app_site_association),
+        )
+        .route("/v1/pid-capture/session", post(create_pid_capture_session))
+        .route("/v1/pid-capture/{id}", get(get_pid_capture_session))
+        .route(
+            "/v1/pid-capture/{id}/evidence",
+            post(submit_pid_capture_evidence),
+        )
         .route("/par", post(par))
         .route("/authorize", get(authorize))
         .route("/token", post(token))
@@ -1134,6 +1161,282 @@ async fn get_credential_offer(
             }
         }
     })))
+}
+
+/// Apple App Site Association so the PID Capture companion (App Clip + full app) can be launched
+/// from the issuer domain. `PID_CAPTURE_APP_ID` (non-secret) supplies `TEAMID.bundle-id`.
+async fn apple_app_site_association() -> Json<Value> {
+    let app_id = std::env::var("PID_CAPTURE_APP_ID")
+        .unwrap_or_else(|_| "TEAMID.systems.advatar.pidcapture".to_owned());
+    Json(capture::apple_app_site_association(&app_id))
+}
+
+/// Open a cross-wallet PID capture session: the target wallet presents its proof-of-possession key,
+/// `VCIssuer` mints an iProov verify token for the companion, and returns the companion invocation
+/// URL (rendered as a QR) plus the client-safe iProov launch parameters.
+async fn create_pid_capture_session(
+    State(state): State<AppState>,
+    Json(request): Json<capture::CreateCaptureSessionRequest>,
+) -> Result<Json<capture::CreateCaptureSessionResponse>, (StatusCode, Json<OAuthError>)> {
+    // The PID will be bound to this target-wallet key (its jkt + JWK become the credential `cnf`).
+    let ec_jwk: EcJwk = serde_json::from_value(request.holder_jwk).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "holder_jwk must be an EC P-256 public JWK",
+        )
+    })?;
+    let (_, holder_jkt, holder_jwk) = verifying_key_and_jwk(&ec_jwk, "invalid_request")?;
+    let now = unix_time()?;
+    let session_id = Uuid::new_v4().to_string();
+    let nonce = random_token();
+    let iproov_user_id = capture::iproov_user_id(&session_id);
+    // Mint a GPA verify token for the companion's capture (server-to-server), when the SP is set.
+    let (iproov_token, iproov_streaming_url, iproov_assurance_type) = match &state.iproov {
+        Some(cfg) => {
+            let token = iproov::create_token(
+                &state.http,
+                cfg,
+                &iproov_user_id,
+                &capture::iproov_resource(&session_id),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "iProov token minting failed");
+                oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "liveness provider is unavailable",
+                )
+            })?;
+            (
+                Some(token),
+                Some(cfg.streaming_url()),
+                Some(cfg.assurance_type().to_owned()),
+            )
+        }
+        None => (None, None, None),
+    };
+    let expires_in = capture::CAPTURE_SESSION_TTL_SECONDS;
+    let expires_at = now.saturating_add(expires_in);
+    let origin = state.issuer.as_str().trim_end_matches('/').to_owned();
+    let invocation_url = capture::invocation_url(&origin, &session_id);
+    state.inner.lock().await.capture_sessions.insert(
+        session_id.clone(),
+        capture::CaptureSession {
+            holder_jkt,
+            holder_jwk,
+            nonce: nonce.clone(),
+            iproov_user_id,
+            iproov_token: iproov_token.clone(),
+            status: capture::CaptureStatus::AwaitingEvidence,
+            credential: None,
+            expires_at,
+        },
+    );
+    Ok(Json(capture::CreateCaptureSessionResponse {
+        session_id,
+        nonce,
+        invocation_url,
+        iproov_token,
+        iproov_streaming_url,
+        iproov_assurance_type,
+        expires_in,
+    }))
+}
+
+/// Poll a capture session. When issued, returns the freshly minted PID as a credential-offer object
+/// the target wallet imports directly.
+async fn get_pid_capture_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    let now = unix_time()?;
+    let inner = state.inner.lock().await;
+    let session = inner.capture_sessions.get(&id).ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            "capture session is unknown",
+        )
+    })?;
+    if session.expires_at < now && session.status != capture::CaptureStatus::Issued {
+        return Err(oauth_error(
+            StatusCode::GONE,
+            "invalid_request",
+            "capture session has expired",
+        ));
+    }
+    let mut body = json!({ "status": session.status });
+    if let Some(credential) = &session.credential {
+        let object = body.as_object_mut().expect("body is an object");
+        object.insert("format".into(), json!("dc+sd-jwt"));
+        object.insert("credential".into(), json!(credential));
+        object.insert(
+            "credential_offer".into(),
+            json!({
+                "credential_issuer": state.issuer.as_str().trim_end_matches('/'),
+                "credential_configuration_ids": [PID_FROM_EMRTD_SD_JWT],
+                "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
+            }),
+        );
+    }
+    Ok(Json(body))
+}
+
+/// Submit chip + liveness evidence for a capture session. `VCIssuer` validates liveness itself
+/// (authoritative, downgrade-closed), verifies the eMRTD attestation welded to this session, runs
+/// the Lean-proved kernel gate, and — on success — mints the PID bound to the target wallet key.
+#[allow(clippy::too_many_lines)]
+async fn submit_pid_capture_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<capture::CaptureEvidenceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    let now = unix_time()?;
+    // Snapshot what we need, then release the lock across the iProov network call.
+    let (holder_jkt, holder_jwk, nonce, iproov_user_id, iproov_token) = {
+        let inner = state.inner.lock().await;
+        let session = inner.capture_sessions.get(&id).ok_or_else(|| {
+            oauth_error(
+                StatusCode::NOT_FOUND,
+                "invalid_request",
+                "capture session is unknown",
+            )
+        })?;
+        if session.expires_at < now {
+            return Err(oauth_error(
+                StatusCode::GONE,
+                "invalid_request",
+                "capture session has expired",
+            ));
+        }
+        if session.status != capture::CaptureStatus::AwaitingEvidence {
+            return Err(oauth_error(
+                StatusCode::CONFLICT,
+                "invalid_request",
+                "capture session is already resolved",
+            ));
+        }
+        (
+            session.holder_jkt.clone(),
+            session.holder_jwk.clone(),
+            session.nonce.clone(),
+            session.iproov_user_id.clone(),
+            session.iproov_token.clone(),
+        )
+    };
+
+    // 1) Authoritative liveness — the ISSUER validates the capture (downgrade-closed). No SP or no
+    //    minted token ⇒ fail closed.
+    let liveness_ok = match (&state.iproov, &iproov_token) {
+        (Some(cfg), Some(token)) => {
+            let client_ip = request.client_ip.as_deref().unwrap_or("0.0.0.0");
+            iproov::validate(&state.http, cfg, token, &iproov_user_id, client_ip)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "iProov validate failed");
+                    oauth_error(
+                        StatusCode::BAD_GATEWAY,
+                        "server_error",
+                        "liveness provider is unavailable",
+                    )
+                })?
+        }
+        _ => false,
+    };
+
+    // 2) eMRTD chip attestation, welded to THIS session's nonce + target holder key.
+    let reader_key = state.trusted_emrtd_reader_key.as_deref().ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "credential_request_denied",
+            "NFC-sourced PID issuance is not configured on this issuer",
+        )
+    })?;
+    let evidence = EmrtdEvidenceObject {
+        attestation: request.attestation,
+    };
+    let mut verified = verify_emrtd_evidence(
+        &evidence,
+        reader_key,
+        &state.issuer,
+        &nonce,
+        &holder_jkt,
+        now,
+    )?;
+    // iProov is the AUTHORITATIVE liveness source: the server-validated verdict REPLACES the
+    // reader's self-reported portrait match before the kernel gate sees it.
+    verified.liveness_matched = liveness_ok;
+
+    let mut inner = state.inner.lock().await;
+    if !inner.binding_jtis.insert(verified.jti.clone()) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_proof",
+            "`eMRTD` evidence attestation jti has already been used",
+        ));
+    }
+    // 3) The Lean-proved kernel gate is the authoritative allow/deny.
+    if let Err(error) = authorize_kernel(
+        PID_FROM_EMRTD_SD_JWT,
+        &holder_jkt,
+        &nonce,
+        None,
+        Some(&verified),
+        now,
+    ) {
+        if let Some(session) = inner.capture_sessions.get_mut(&id) {
+            session.status = capture::CaptureStatus::Failed;
+        }
+        return Err(error);
+    }
+
+    // 4) Mint the PID bound to the TARGET wallet key (the companion is only a sensor) and deliver it
+    //    as a credential-offer. Signing requires the macOS Keychain (mirrors the /credential path).
+    #[cfg(target_os = "macos")]
+    {
+        let signer = state
+            .credential_signers
+            .get(PID_FROM_EMRTD_SD_JWT)
+            .expect("closed profile has a signer");
+        let credential = issue_sd_jwt(
+            signer,
+            &state.issuer,
+            PID_FROM_EMRTD_SD_JWT,
+            &holder_jwk,
+            now,
+            None,
+            Some(&verified.claims),
+        )?;
+        let session = inner
+            .capture_sessions
+            .get_mut(&id)
+            .expect("session existed above");
+        session.status = capture::CaptureStatus::Issued;
+        session.credential = Some(credential.clone());
+        session.iproov_token = None; // single-use
+        drop(inner);
+        Ok(Json(json!({
+            "status": "issued",
+            "format": "dc+sd-jwt",
+            "credential": credential,
+            "credential_offer": {
+                "credential_issuer": state.issuer.as_str().trim_end_matches('/'),
+                "credential_configuration_ids": [PID_FROM_EMRTD_SD_JWT],
+                "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
+            }
+        })))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        drop(inner);
+        Err(oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "credential_request_denied",
+            "this development build requires macOS Keychain",
+        ))
+    }
 }
 
 async fn authorize(
@@ -3836,6 +4139,64 @@ mod tests {
                 &issuer,
                 nonce,
                 "other",
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_flow_liveness_is_iproov_authoritative() {
+        // The capture handler verifies the reader attestation, then OVERRIDES liveness_matched with
+        // the issuer's OWN iProov validate verdict before the kernel gate. Prove that override is
+        // what decides issuance: a reader self-reporting matched_portrait:true cannot mint if the
+        // issuer's authoritative liveness check failed.
+        let now = unix_time().expect("clock");
+        let issuer = Url::parse("http://127.0.0.1:18080").expect("issuer");
+        let reader = SigningKey::from_slice(&[11; 32]).expect("reader key");
+        let trusted = reader
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let (nonce, holder) = ("nfc-nonce-cap", "holder-jkt-cap");
+        let payload = emrtd_evidence_payload(issuer.as_str(), nonce, holder, now);
+        let mut verified = verify_emrtd_evidence(
+            &emrtd_evidence(&reader, &payload),
+            &trusted,
+            &issuer,
+            nonce,
+            holder,
+            now,
+        )
+        .expect("valid attestation");
+        // The attestation self-reports a matched portrait.
+        assert!(verified.liveness_matched);
+
+        // Issuer's authoritative iProov verdict = pass ⇒ the gate authorises.
+        verified.liveness_matched = true;
+        assert!(
+            authorize_kernel(
+                PID_FROM_EMRTD_SD_JWT,
+                holder,
+                nonce,
+                None,
+                Some(&verified),
+                now
+            )
+            .is_ok()
+        );
+
+        // Issuer's authoritative iProov validate FAILED ⇒ the override denies issuance, regardless
+        // of what the reader claimed.
+        verified.liveness_matched = false;
+        assert!(
+            authorize_kernel(
+                PID_FROM_EMRTD_SD_JWT,
+                holder,
+                nonce,
+                None,
+                Some(&verified),
                 now
             )
             .is_err()
