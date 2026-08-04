@@ -13,10 +13,14 @@
 //! End-to-end acceptance of a real device attestation is validated on-device (no attestation blob
 //! can be produced off a real iPhone); the deterministic sub-steps are unit-tested here.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use ciborium::value::Value as CborValue;
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode, Encode};
@@ -77,12 +81,48 @@ impl AppAttestConfig {
 
 /// A registered app instance: which app id it attested under, its attested P-256 public key (SEC1
 /// uncompressed point), and the monotonic assertion counter.
-#[derive(Clone)]
+///
+/// `Serialize`/`Deserialize` so the instance table can be persisted across restarts (see
+/// [`load_instances`] / [`save_instances`]): without persistence a restart drops every registration,
+/// which both re-opens the replay counter and locks out already-registered clients (Apple issues one
+/// attestation per key, so a client cannot silently re-register).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegisteredInstance {
     /// The `TEAMID.bundle-id` this instance attested under (an assertion's `rpIdHash` must match it).
     pub app_id: String,
     pub public_key: Vec<u8>,
     pub sign_count: u32,
+}
+
+/// Load the persisted `keyId → RegisteredInstance` table from `path`. A missing or unreadable file
+/// yields an empty table (fail-safe: unknown instances are rejected, never fail-open).
+#[must_use]
+pub fn load_instances(path: &Path) -> HashMap<String, RegisteredInstance> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        tracing::warn!(%error, "App Attest store is unreadable; starting with an empty table");
+        HashMap::new()
+    })
+}
+
+/// Atomically persist the `keyId → RegisteredInstance` table to `path` (write a temp file, then
+/// rename). Best-effort: serialization or I/O failures are logged, never fatal — the in-memory table
+/// remains authoritative for the running process.
+pub fn save_instances(path: &Path, instances: &HashMap<String, RegisteredInstance>) {
+    let Ok(json) = serde_json::to_vec(instances) else {
+        tracing::error!("cannot serialize the App Attest instance store");
+        return;
+    };
+    let tmp = path.with_extension("tmp");
+    if let Err(error) = std::fs::write(&tmp, &json) {
+        tracing::error!(%error, "cannot write the App Attest store temp file");
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        tracing::error!(%error, "cannot atomically replace the App Attest store");
+    }
 }
 
 /// Verify an App Attest attestation and return the attested P-256 public key (SEC1 point) on
@@ -444,6 +484,35 @@ mod tests {
         assert_eq!(verify_assertion(&cbor, body_a, &instance).unwrap(), 1);
         // …a tampered/different body does not (the signed nonce no longer matches).
         assert!(verify_assertion(&cbor, body_b, &instance).is_err());
+    }
+
+    #[test]
+    fn instance_store_round_trips_and_preserves_the_counter() {
+        // Persisting then loading must return the same instances (app id + key + advanced counter),
+        // so a restart cannot reset sign_count (replay) or drop the registration (lock-out).
+        let mut instances = HashMap::new();
+        instances.insert(
+            "keyid-aaa".to_string(),
+            RegisteredInstance {
+                app_id: TEST_APP_ID.into(),
+                public_key: vec![4, 1, 2, 3, 4],
+                sign_count: 42,
+            },
+        );
+        let path = std::env::temp_dir().join("vcissuer-appattest-store-round-trip.json");
+        let _ = std::fs::remove_file(&path);
+        save_instances(&path, &instances);
+        let loaded = load_instances(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+        let entry = loaded.get("keyid-aaa").expect("entry present");
+        assert_eq!(entry.app_id, TEST_APP_ID);
+        assert_eq!(entry.public_key, vec![4, 1, 2, 3, 4]);
+        assert_eq!(entry.sign_count, 42);
+        // A missing store is empty, never an error (fail-safe, not fail-open).
+        let missing = std::env::temp_dir().join("vcissuer-appattest-store-does-not-exist.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_instances(&missing).is_empty());
     }
 
     #[test]

@@ -21,6 +21,7 @@ mod svipe;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -128,6 +129,10 @@ struct AppState {
     iproov: Option<iproov::IProovConfig>,
     /// Apple App Attest configuration. `None` disables the App Attest endpoints (fail closed).
     app_attest: Option<app_attest::AppAttestConfig>,
+    /// Durable store for registered App Attest instances (keyId → key + monotonic counter). `Some`
+    /// (from `APP_ATTEST_STORE_PATH`) ⇒ instances survive restarts, so the replay counter is
+    /// preserved and already-registered clients are not locked out. `None` ⇒ in-memory only.
+    app_attest_store: Option<PathBuf>,
     /// APNs provider configuration. `None` disables push (registration + sends are no-ops).
     apns: Option<apns::ApnsConfig>,
     /// Shared client for server-to-server iProov calls.
@@ -554,6 +559,27 @@ async fn main() {
         )
     });
 
+    // Apple App Attest: log whether it is configured (like iProov above), and — if a durable store
+    // path is set — restore registered instances so a restart does not reset replay counters or lock
+    // out already-registered clients.
+    let app_attest_config = app_attest::AppAttestConfig::from_env();
+    let app_attest_store = env_file::var("APP_ATTEST_STORE_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    info!(
+        app_attest_configured = app_attest_config.is_some(),
+        app_attest_persistent = app_attest_store.is_some(),
+        "Apple App Attest configuration loaded"
+    );
+    let mut volatile = VolatileState::default();
+    if let Some(path) = &app_attest_store {
+        volatile.app_attest_instances = app_attest::load_instances(path);
+        info!(
+            restored_instances = volatile.app_attest_instances.len(),
+            "restored App Attest instances from the durable store"
+        );
+    }
+
     let app = app(AppState {
         issuer,
         trusted_notary_key,
@@ -562,10 +588,11 @@ async fn main() {
         hybrid_pq_enabled,
         tlsn_demo_notary,
         iproov: iproov_config,
-        app_attest: app_attest::AppAttestConfig::from_env(),
+        app_attest: app_attest_config,
+        app_attest_store,
         apns: apns::ApnsConfig::from_env(),
         http,
-        inner: Arc::new(Mutex::new(VolatileState::default())),
+        inner: Arc::new(Mutex::new(volatile)),
         #[cfg(target_os = "macos")]
         metadata_signer: Arc::new(
             KeychainSigner::find_or_create("dev.advatar.vcissuer.metadata")
@@ -1762,14 +1789,20 @@ async fn app_attest_register(
             "App Attest attestation was rejected",
         )
     })?;
-    state.inner.lock().await.app_attest_instances.insert(
-        request.key_id,
-        app_attest::RegisteredInstance {
-            app_id,
-            public_key,
-            sign_count: 0,
-        },
-    );
+    {
+        let mut inner = state.inner.lock().await;
+        inner.app_attest_instances.insert(
+            request.key_id,
+            app_attest::RegisteredInstance {
+                app_id,
+                public_key,
+                sign_count: 0,
+            },
+        );
+        if let Some(path) = &state.app_attest_store {
+            app_attest::save_instances(path, &inner.app_attest_instances);
+        }
+    }
     Ok(Json(json!({ "registered": true })))
 }
 
@@ -1847,6 +1880,10 @@ async fn verify_app_attest_assertion(
         })?;
     if let Some(entry) = inner.app_attest_instances.get_mut(key_id) {
         entry.sign_count = new_count;
+    }
+    // Persist the advanced counter so a restart cannot reset it (and re-open a replay window).
+    if let Some(path) = &state.app_attest_store {
+        app_attest::save_instances(path, &inner.app_attest_instances);
     }
     Ok(())
 }
