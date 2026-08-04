@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod activechain_schema;
-// Apple App Attest verification (register an app instance + verify assertions). Wired to endpoints
-// below; allow(dead_code) covers the assertion path until every protected route adopts it.
-#[allow(dead_code)]
+// Apple App Attest verification (register an app instance + verify assertions).
 mod app_attest;
 mod capture;
 mod env_file;
@@ -125,6 +123,8 @@ struct AppState {
     /// iProov Service-Provider configuration for the cross-wallet PID capture flow. `None` disables
     /// capture-session issuance (liveness cannot be validated ⇒ fail closed).
     iproov: Option<iproov::IProovConfig>,
+    /// Apple App Attest configuration. `None` disables the App Attest endpoints (fail closed).
+    app_attest: Option<app_attest::AppAttestConfig>,
     /// Shared client for server-to-server iProov calls.
     http: reqwest::Client,
     inner: Arc<Mutex<VolatileState>>,
@@ -149,6 +149,10 @@ struct VolatileState {
     offers: HashMap<String, CredentialOffer>,
     tlsn_sessions: HashSet<String>,
     capture_sessions: HashMap<String, capture::CaptureSession>,
+    /// Outstanding single-use App Attest challenges → expiry (unix seconds).
+    app_attest_challenges: HashMap<String, u64>,
+    /// Registered App Attest instances, keyed by the base64url keyId.
+    app_attest_instances: HashMap<String, app_attest::RegisteredInstance>,
 }
 
 #[derive(Clone)]
@@ -551,6 +555,7 @@ async fn main() {
         hybrid_pq_enabled,
         tlsn_demo_notary,
         iproov: iproov_config,
+        app_attest: app_attest::AppAttestConfig::from_env(),
         http,
         inner: Arc::new(Mutex::new(VolatileState::default())),
         #[cfg(target_os = "macos")]
@@ -626,6 +631,9 @@ fn app(state: AppState) -> Router {
             "/.well-known/apple-app-site-association",
             get(apple_app_site_association),
         )
+        .route("/v1/app-attest/challenge", post(app_attest_challenge))
+        .route("/v1/app-attest/register", post(app_attest_register))
+        .route("/v1/app-attest/assert", post(app_attest_assert))
         .route("/v1/pid-capture/session", post(create_pid_capture_session))
         .route("/v1/pid-capture/{id}", get(get_pid_capture_session))
         .route(
@@ -1564,6 +1572,190 @@ async fn submit_pid_capture_evidence(
             "this development build requires macOS Keychain",
         ))
     }
+}
+
+/// Maximum accepted size of a base64-decoded App Attest attestation object.
+const MAX_APP_ATTEST_BYTES: usize = 8 * 1024;
+
+#[derive(Serialize)]
+struct AppAttestChallengeResponse {
+    challenge: String,
+    expires_in: u64,
+}
+
+/// Issue a single-use App Attest challenge the app hashes into its attestation/assertion.
+async fn app_attest_challenge(
+    State(state): State<AppState>,
+) -> Result<Json<AppAttestChallengeResponse>, (StatusCode, Json<OAuthError>)> {
+    if state.app_attest.is_none() {
+        return Err(oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_enabled",
+            "App Attest is not configured on this issuer",
+        ));
+    }
+    let now = unix_time()?;
+    let challenge = random_token();
+    let expires_in = 300;
+    let mut inner = state.inner.lock().await;
+    inner.app_attest_challenges.retain(|_, exp| *exp > now);
+    inner
+        .app_attest_challenges
+        .insert(challenge.clone(), now.saturating_add(expires_in));
+    drop(inner);
+    Ok(Json(AppAttestChallengeResponse {
+        challenge,
+        expires_in,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppAttestRegisterRequest {
+    /// base64 keyId from `DCAppAttestService.generateKey()`.
+    key_id: String,
+    /// base64 CBOR attestation object.
+    attestation: String,
+    /// The exact challenge string this issuer handed out.
+    challenge: String,
+}
+
+/// Verify an App Attest attestation and register the app instance (keyId → attested P-256 key).
+async fn app_attest_register(
+    State(state): State<AppState>,
+    Json(request): Json<AppAttestRegisterRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    let config = state.app_attest.as_ref().ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_enabled",
+            "App Attest is not configured on this issuer",
+        )
+    })?;
+    let now = unix_time()?;
+    // Consume the single-use challenge (must be one we issued and still fresh).
+    {
+        let mut inner = state.inner.lock().await;
+        match inner.app_attest_challenges.remove(&request.challenge) {
+            Some(exp) if exp > now => {}
+            _ => {
+                return Err(oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "unknown or expired App Attest challenge",
+                ));
+            }
+        }
+    }
+    let key_id = STANDARD.decode(&request.key_id).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "keyId is not base64",
+        )
+    })?;
+    let attestation = STANDARD.decode(&request.attestation).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "attestation is not base64",
+        )
+    })?;
+    if attestation.len() > MAX_APP_ATTEST_BYTES {
+        return Err(oauth_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request",
+            "attestation exceeds the accepted size",
+        ));
+    }
+    let public_key = app_attest::verify_attestation(
+        &attestation,
+        request.challenge.as_bytes(),
+        &key_id,
+        config,
+        now,
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "App Attest registration rejected");
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_attestation",
+            "App Attest attestation was rejected",
+        )
+    })?;
+    state.inner.lock().await.app_attest_instances.insert(
+        request.key_id,
+        app_attest::RegisteredInstance {
+            public_key,
+            sign_count: 0,
+        },
+    );
+    Ok(Json(json!({ "registered": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppAttestAssertRequest {
+    key_id: String,
+    /// base64 CBOR assertion.
+    assertion: String,
+    /// base64 of the exact request bytes the app signed.
+    client_data: String,
+}
+
+/// Verify an App Attest assertion from a registered instance (proves a genuine app instance made the
+/// call) and advance its replay counter.
+async fn app_attest_assert(
+    State(state): State<AppState>,
+    Json(request): Json<AppAttestAssertRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<OAuthError>)> {
+    let config = state.app_attest.as_ref().ok_or_else(|| {
+        oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_enabled",
+            "App Attest is not configured on this issuer",
+        )
+    })?;
+    let assertion = STANDARD.decode(&request.assertion).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "assertion is not base64",
+        )
+    })?;
+    let client_data = STANDARD.decode(&request.client_data).map_err(|_| {
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_data is not base64",
+        )
+    })?;
+    let mut inner = state.inner.lock().await;
+    let instance = inner
+        .app_attest_instances
+        .get(&request.key_id)
+        .cloned()
+        .ok_or_else(|| {
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_instance",
+                "App Attest instance is not registered",
+            )
+        })?;
+    let new_count = app_attest::verify_assertion(&assertion, &client_data, &instance, config)
+        .map_err(|error| {
+            tracing::warn!(%error, "App Attest assertion rejected");
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_assertion",
+                "App Attest assertion was rejected",
+            )
+        })?;
+    if let Some(entry) = inner.app_attest_instances.get_mut(&request.key_id) {
+        entry.sign_count = new_count;
+    }
+    drop(inner);
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn authorize(
