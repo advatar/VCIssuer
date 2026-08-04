@@ -2,6 +2,7 @@
 
 mod activechain_schema;
 mod capture;
+mod env_file;
 mod hybrid_codec;
 #[cfg(target_os = "macos")]
 mod hybrid_signer;
@@ -421,13 +422,19 @@ struct OAuthError {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() {
+    // Optional dev-only `.env` (process environment always wins; see env_file). Load before tracing
+    // so it can also supply config, then log whether a file was found (never its contents).
+    let dotenv_status = env_file::init();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Some((path, keys)) = &dotenv_status {
+        info!(%path, keys, "loaded .env (process environment overrides these)");
+    }
 
-    let issuer = std::env::var("ISSUER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let issuer = env_file::var("ISSUER_URL").unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let issuer = Url::parse(&issuer).expect("ISSUER_URL must be an absolute URL");
-    let trusted_notary_key = std::env::var("TLSN_TRUSTED_NOTARY_KEY")
+    let trusted_notary_key = env_file::var("TLSN_TRUSTED_NOTARY_KEY")
         .expect("TLSN_TRUSTED_NOTARY_KEY must contain the hex SEC1 P-256 notary public key");
     let trusted_notary_key =
         hex::decode(trusted_notary_key).expect("TLSN_TRUSTED_NOTARY_KEY must be valid hex");
@@ -435,7 +442,7 @@ async fn main() {
         .expect("TLSN_TRUSTED_NOTARY_KEY must be a SEC1 P-256 public key");
     // Optional: the trusted notary's ML-DSA-65 public key. When set, TLSNotary artifacts must carry
     // a valid post-quantum second signature (downgrade-closed hybrid); absent → ES256-only accepted.
-    let trusted_notary_pq_key = std::env::var("TLSN_TRUSTED_NOTARY_PQ_KEY").ok().map(|hex| {
+    let trusted_notary_pq_key = env_file::var("TLSN_TRUSTED_NOTARY_PQ_KEY").map(|hex| {
         let key = hex::decode(hex).expect("TLSN_TRUSTED_NOTARY_PQ_KEY must be valid hex");
         assert_eq!(
             key.len(),
@@ -447,18 +454,18 @@ async fn main() {
     // Optional: the trusted `eMRTD`-reader / liveness backend key that attests NFC PID evidence.
     // Absent → the NFC-sourced PID endpoint is disabled (fails closed) and existing deployments are
     // unaffected.
-    let trusted_emrtd_reader_key = std::env::var("EMRTD_TRUSTED_READER_KEY").ok().map(|hex| {
+    let trusted_emrtd_reader_key = env_file::var("EMRTD_TRUSTED_READER_KEY").map(|hex| {
         let key = hex::decode(hex).expect("EMRTD_TRUSTED_READER_KEY must be valid hex");
         VerifyingKey::from_sec1_bytes(&key)
             .expect("EMRTD_TRUSTED_READER_KEY must be a SEC1 P-256 public key");
         key
     });
-    let address: SocketAddr = std::env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8080".into())
+    let address: SocketAddr = env_file::var("LISTEN_ADDR")
+        .unwrap_or_else(|| "127.0.0.1:8080".into())
         .parse()
         .expect("LISTEN_ADDR must be a socket address");
-    let hybrid_pq_enabled = std::env::var("ENABLE_EXPERIMENTAL_HYBRID_PQ")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let hybrid_pq_enabled = env_file::var("ENABLE_EXPERIMENTAL_HYBRID_PQ")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     // iProov Service-Provider credentials (same MANDAMUS_IPROOV_* the Web/iOS SDKs use). Absent ⇒
     // the cross-wallet PID capture flow is disabled and fails closed. Log only whether it is set.
     let iproov_config = iproov::IProovConfig::from_env();
@@ -541,7 +548,7 @@ async fn main() {
 }
 
 fn app(state: AppState) -> Router {
-    let configured_origins: HashSet<String> = std::env::var("CORS_ORIGINS")
+    let configured_origins: HashSet<String> = env_file::var("CORS_ORIGINS")
         .unwrap_or_default()
         .split(',')
         .filter(|value| !value.is_empty())
@@ -1166,8 +1173,8 @@ async fn get_credential_offer(
 /// Apple App Site Association so the PID Capture companion (App Clip + full app) can be launched
 /// from the issuer domain. `PID_CAPTURE_APP_ID` (non-secret) supplies `TEAMID.bundle-id`.
 async fn apple_app_site_association() -> Json<Value> {
-    let app_id = std::env::var("PID_CAPTURE_APP_ID")
-        .unwrap_or_else(|_| "TEAMID.systems.advatar.pidcapture".to_owned());
+    let app_id = env_file::var("PID_CAPTURE_APP_ID")
+        .unwrap_or_else(|| "TEAMID.systems.advatar.pidcapture".to_owned());
     Json(capture::apple_app_site_association(&app_id))
 }
 

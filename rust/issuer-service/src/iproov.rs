@@ -79,24 +79,18 @@ impl IProovConfig {
     /// then disables the iProov-gated flow (fail-closed), never a partial configuration.
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let base_url = std::env::var("MANDAMUS_IPROOV_BASE_URL")
-            .ok()
+        // `crate::env_file::var` = process environment first, then an optional dev `.env`.
+        let base_url = crate::env_file::var("MANDAMUS_IPROOV_BASE_URL")
             .filter(|v| !v.is_empty())?
             .trim_end_matches('/')
             .to_owned();
-        let api_key = std::env::var("MANDAMUS_IPROOV_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())?;
-        let secret = std::env::var("MANDAMUS_IPROOV_SECRET")
-            .ok()
-            .filter(|v| !v.is_empty())?;
-        let assurance_type = std::env::var("MANDAMUS_IPROOV_ASSURANCE_TYPE")
-            .ok()
+        let api_key = crate::env_file::var("MANDAMUS_IPROOV_API_KEY").filter(|v| !v.is_empty())?;
+        let secret = crate::env_file::var("MANDAMUS_IPROOV_SECRET").filter(|v| !v.is_empty())?;
+        let assurance_type = crate::env_file::var("MANDAMUS_IPROOV_ASSURANCE_TYPE")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| ASSURANCE_GENUINE_PRESENCE.to_owned());
-        let web_base_url = std::env::var("MANDAMUS_IPROOV_WEB_BASE_URL")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let web_base_url =
+            crate::env_file::var("MANDAMUS_IPROOV_WEB_BASE_URL").filter(|v| !v.is_empty());
         Some(Self {
             api_key,
             secret,
