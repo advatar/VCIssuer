@@ -1273,6 +1273,13 @@ async fn get_pid_capture_session(
     if session.status == capture::CaptureStatus::AwaitingEvidence {
         let object = body.as_object_mut().expect("body is an object");
         object.insert("nonce".into(), json!(session.nonce));
+        // The reader must weld the attestation to the TARGET wallet key + this issuer (a public key
+        // thumbprint + origin, not secrets) so verify_emrtd_evidence's binding check passes.
+        object.insert("holder_jkt".into(), json!(session.holder_jkt));
+        object.insert(
+            "audience".into(),
+            json!(state.issuer.as_str().trim_end_matches('/')),
+        );
         if let Some(token) = &session.iproov_token {
             object.insert("iproov_token".into(), json!(token));
         }
