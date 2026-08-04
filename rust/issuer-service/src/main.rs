@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
 mod activechain_schema;
+// Apple App Attest verification (register an app instance + verify assertions). Wired to endpoints
+// below; allow(dead_code) covers the assertion path until every protected route adopts it.
+#[allow(dead_code)]
+mod app_attest;
 mod capture;
 mod env_file;
 mod hybrid_codec;
