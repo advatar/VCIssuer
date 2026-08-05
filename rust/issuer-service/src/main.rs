@@ -1372,8 +1372,14 @@ async fn create_pid_capture_session(
     };
     let expires_in = capture::CAPTURE_SESSION_TTL_SECONDS;
     let expires_at = now.saturating_add(expires_in);
-    let origin = state.issuer.as_str().trim_end_matches('/').to_owned();
-    let invocation_url = capture::invocation_url(&origin, &session_id);
+    // The companion is launched from the PID-capture invocation origin, which may be a dedicated
+    // host that serves the App Site Association and proxies the capture API (so the universal link
+    // opens the companion app). It falls back to the issuer origin when the env is unset.
+    let invocation_origin = capture::invocation_origin(
+        env_file::var("PID_CAPTURE_INVOCATION_ORIGIN"),
+        state.issuer.as_str(),
+    );
+    let invocation_url = capture::invocation_url(&invocation_origin, &session_id);
     state.inner.lock().await.capture_sessions.insert(
         session_id.clone(),
         capture::CaptureSession {

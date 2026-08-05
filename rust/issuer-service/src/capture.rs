@@ -100,14 +100,28 @@ pub fn iproov_resource(session_id: &str) -> String {
 }
 
 /// The HTTPS invocation URL a target wallet renders as a QR; scanning it launches the companion
-/// (App Clip on iOS) for this session. `origin` is the issuer origin (scheme + host), no trailing
-/// slash.
+/// (App Clip on iOS) for this session. `origin` is the PID-capture invocation origin (scheme +
+/// host) — see [`invocation_origin`], which may differ from the issuer's own origin. A trailing
+/// slash is trimmed.
 #[must_use]
 pub fn invocation_url(origin: &str, session_id: &str) -> String {
     format!(
         "{}/pid-capture?session={session_id}",
         origin.trim_end_matches('/')
     )
+}
+
+/// Resolve the origin used to build the companion invocation URL. The PID-capture invocation origin
+/// can legitimately differ from the issuer's own origin — e.g. a dedicated host that serves the
+/// Apple App Site Association and proxies the capture API, so the universal link opens the companion
+/// app — so it is configured independently (`PID_CAPTURE_INVOCATION_ORIGIN`) and falls back to
+/// `issuer_origin` when unset or blank. Whitespace and a trailing slash are trimmed.
+#[must_use]
+pub fn invocation_origin(configured: Option<String>, issuer_origin: &str) -> String {
+    configured
+        .map(|origin| origin.trim().trim_end_matches('/').to_owned())
+        .filter(|origin| !origin.is_empty())
+        .unwrap_or_else(|| issuer_origin.trim_end_matches('/').to_owned())
 }
 
 /// Build the `OpenID4VCI` credential offer for a freshly-issued PID, returning BOTH:
@@ -162,6 +176,28 @@ mod tests {
         assert_eq!(
             invocation_url("https://issuer.advatar.systems/", "sess-123"),
             "https://issuer.advatar.systems/pid-capture?session=sess-123"
+        );
+    }
+
+    #[test]
+    fn invocation_origin_prefers_configured_then_issuer() {
+        // A configured origin wins and is trimmed of a trailing slash.
+        assert_eq!(
+            invocation_origin(
+                Some("https://pid.advatar.systems/".to_owned()),
+                "https://issuer.advatar.systems"
+            ),
+            "https://pid.advatar.systems"
+        );
+        // Unset falls back to the issuer origin (also trimmed).
+        assert_eq!(
+            invocation_origin(None, "https://issuer.advatar.systems/"),
+            "https://issuer.advatar.systems"
+        );
+        // A blank/whitespace configured value is ignored, so a stray empty env cannot break links.
+        assert_eq!(
+            invocation_origin(Some("   ".to_owned()), "https://issuer.advatar.systems"),
+            "https://issuer.advatar.systems"
         );
     }
 
