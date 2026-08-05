@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use url::Url;
 
 /// How long a capture session accepts evidence before it must be recreated.
 pub const CAPTURE_SESSION_TTL_SECONDS: u64 = 900;
@@ -109,6 +110,29 @@ pub fn invocation_url(origin: &str, session_id: &str) -> String {
     )
 }
 
+/// Build the `OpenID4VCI` credential offer for a freshly-issued PID, returning BOTH:
+/// - the offer object, returned in-band so a target wallet polling `GET /v1/pid-capture/{id}`
+///   (the cross-device path) can ingest it; and
+/// - an `openid-credential-offer://` by-value deep link, so the companion can hand the PID off to a
+///   wallet on the SAME device (a "final redirect"), or a wallet can open it directly.
+///
+/// The offer is carried by value (no `credential_offer_uri` round-trip) so it works offline and
+/// cross-app without an extra fetch. `issuer_origin` must have no trailing slash.
+#[must_use]
+pub fn credential_offer(issuer_origin: &str, config_id: &str, credential: &str) -> (Value, String) {
+    let offer = json!({
+        "credential_issuer": issuer_origin,
+        "credential_configuration_ids": [config_id],
+        "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
+    });
+    let mut link = Url::parse("openid-credential-offer://").expect("static scheme is valid");
+    link.query_pairs_mut().append_pair(
+        "credential_offer",
+        &serde_json::to_string(&offer).expect("offer object serialises"),
+    );
+    (offer, link.to_string())
+}
+
 /// Build the `apple-app-site-association` document that lets the companion App Clip (and full app)
 /// be invoked from the issuer domain. `app_id` is `TEAMID.bundle-id`; the App Clip id is
 /// `{app_id}.Clip` by Apple convention.
@@ -162,6 +186,30 @@ mod tests {
             aasa["applinks"]["details"][0]["components"][0]["/"],
             "/pid-capture*"
         );
+    }
+
+    #[test]
+    fn credential_offer_yields_object_and_by_value_deep_link() {
+        let (offer, link) = credential_offer(
+            "https://issuer.advatar.systems",
+            "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc",
+            "eyJ.sd-jwt.credential~",
+        );
+        assert_eq!(offer["credential_issuer"], "https://issuer.advatar.systems");
+        assert_eq!(
+            offer["credential_configuration_ids"][0],
+            "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc"
+        );
+        // The deep link is a by-value openid-credential-offer:// URI whose `credential_offer` query
+        // parameter round-trips back to the exact offer object the wallet must ingest.
+        assert!(link.starts_with("openid-credential-offer://?credential_offer="));
+        let parsed = Url::parse(&link).unwrap();
+        let carried = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "credential_offer")
+            .map(|(_, v)| v.into_owned())
+            .expect("credential_offer query present");
+        assert_eq!(serde_json::from_str::<Value>(&carried).unwrap(), offer);
     }
 
     #[test]

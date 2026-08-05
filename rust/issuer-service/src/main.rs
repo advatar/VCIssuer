@@ -1317,8 +1317,10 @@ async fn get_credential_offer(
 /// Apple App Site Association so the PID Capture companion (App Clip + full app) can be launched
 /// from the issuer domain. `PID_CAPTURE_APP_ID` (non-secret) supplies `TEAMID.bundle-id`.
 async fn apple_app_site_association() -> Json<Value> {
+    // `TEAMID.bundle-id`. Default matches the shipped PID Capture app (team L2AF8KFX35, bundle
+    // eu.advatar.wallet.pidcapture); override via env for other deployments/teams.
     let app_id = env_file::var("PID_CAPTURE_APP_ID")
-        .unwrap_or_else(|| "TEAMID.systems.advatar.pidcapture".to_owned());
+        .unwrap_or_else(|| "L2AF8KFX35.eu.advatar.wallet.pidcapture".to_owned());
     Json(capture::apple_app_site_association(&app_id))
 }
 
@@ -1441,17 +1443,17 @@ async fn get_pid_capture_session(
         }
     }
     if let Some(credential) = &session.credential {
+        let (offer, deep_link) = capture::credential_offer(
+            state.issuer.as_str().trim_end_matches('/'),
+            PID_FROM_EMRTD_SD_JWT,
+            credential,
+        );
         let object = body.as_object_mut().expect("body is an object");
         object.insert("format".into(), json!("dc+sd-jwt"));
         object.insert("credential".into(), json!(credential));
-        object.insert(
-            "credential_offer".into(),
-            json!({
-                "credential_issuer": state.issuer.as_str().trim_end_matches('/'),
-                "credential_configuration_ids": [PID_FROM_EMRTD_SD_JWT],
-                "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
-            }),
-        );
+        object.insert("credential_offer".into(), offer);
+        // `openid-credential-offer://` deep link: same-device hand-off, or direct wallet ingest.
+        object.insert("deep_link".into(), json!(deep_link));
     }
     Ok(Json(body))
 }
@@ -1617,15 +1619,19 @@ async fn submit_pid_capture_evidence(
                 }
             });
         }
+        let (offer, deep_link) = capture::credential_offer(
+            state.issuer.as_str().trim_end_matches('/'),
+            PID_FROM_EMRTD_SD_JWT,
+            &credential,
+        );
         Ok(Json(json!({
             "status": "issued",
             "format": "dc+sd-jwt",
             "credential": credential,
-            "credential_offer": {
-                "credential_issuer": state.issuer.as_str().trim_end_matches('/'),
-                "credential_configuration_ids": [PID_FROM_EMRTD_SD_JWT],
-                "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
-            }
+            "credential_offer": offer,
+            // `openid-credential-offer://` deep link so the companion can hand the PID to a wallet on
+            // the same device; the target wallet also receives it via the poll response above.
+            "deep_link": deep_link,
         })))
     }
     #[cfg(not(target_os = "macos"))]
