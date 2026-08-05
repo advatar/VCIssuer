@@ -1464,6 +1464,18 @@ async fn get_pid_capture_session(
     Ok(Json(body))
 }
 
+/// The authoritative face<->document binding for a captured PID: BOTH the issuer's own
+/// genuine-presence liveness verdict (iProov, server-to-server) AND the trusted reader/liveness
+/// backend's attested live-face <-> DG2 portrait match (likeness). Requiring both is downgrade-closed
+/// — proving a live human is not enough; that human must also match the document being minted.
+#[must_use]
+fn portrait_matched_liveness(
+    iproov_liveness_ok: bool,
+    reader_attested_portrait_match: bool,
+) -> bool {
+    iproov_liveness_ok && reader_attested_portrait_match
+}
+
 /// Submit chip + liveness evidence for a capture session. `VCIssuer` validates liveness itself
 /// (authoritative, downgrade-closed), verifies the eMRTD attestation welded to this session, runs
 /// the Lean-proved kernel gate, and — on success — mints the PID bound to the target wallet key.
@@ -1556,9 +1568,12 @@ async fn submit_pid_capture_evidence(
         &holder_jkt,
         now,
     )?;
-    // iProov is the AUTHORITATIVE liveness source: the server-validated verdict REPLACES the
-    // reader's self-reported portrait match before the kernel gate sees it.
-    verified.liveness_matched = liveness_ok;
+    // Bind the live person to the document: REQUIRE BOTH the issuer's authoritative genuine-presence
+    // liveness verdict (iProov, validated server-to-server) AND the trusted reader's attested
+    // live-face <-> DG2 portrait match (likeness). Downgrade-closed — missing either refuses.
+    let reader_attested_portrait_match = verified.liveness_matched;
+    verified.liveness_matched =
+        portrait_matched_liveness(liveness_ok, reader_attested_portrait_match);
 
     let mut inner = state.inner.lock().await;
     if !inner.binding_jtis.insert(verified.jti.clone()) {
@@ -4695,11 +4710,21 @@ mod tests {
     }
 
     #[test]
+    fn portrait_matched_liveness_requires_both_liveness_and_likeness() {
+        // The face<->document binding needs BOTH: a live, present human (iProov) AND that human
+        // matching the document portrait (reader-attested likeness). Either alone is insufficient.
+        assert!(portrait_matched_liveness(true, true));
+        assert!(!portrait_matched_liveness(true, false)); // live human, but not the document's subject
+        assert!(!portrait_matched_liveness(false, true)); // matches the photo, but not proven live
+        assert!(!portrait_matched_liveness(false, false));
+    }
+
+    #[test]
     fn capture_flow_liveness_is_iproov_authoritative() {
-        // The capture handler verifies the reader attestation, then OVERRIDES liveness_matched with
-        // the issuer's OWN iProov validate verdict before the kernel gate. Prove that override is
-        // what decides issuance: a reader self-reporting matched_portrait:true cannot mint if the
-        // issuer's authoritative liveness check failed.
+        // The capture handler combines the reader's attested portrait match (likeness) with the
+        // issuer's own iProov liveness verdict via `portrait_matched_liveness` (both required). This
+        // test pins the downstream half: given the combined verdict, the kernel gate authorises iff
+        // it is true.
         let now = unix_time().expect("clock");
         let issuer = Url::parse("http://127.0.0.1:18080").expect("issuer");
         let reader = SigningKey::from_slice(&[11; 32]).expect("reader key");
