@@ -37,7 +37,7 @@ jobs:
         run: |
           metadata=$(curl --fail --silent --show-error https://issuer.advatar.systems/.well-known/openid-credential-issuer)
           test "$(jq -r '.signed_metadata | split(".") | length' <<<"$metadata")" = 3
-          test "$(curl --fail --silent --show-error https://issuer.advatar.systems/jwks.json | jq '.keys | length')" = 8
+          test "$(curl --fail --silent --show-error https://issuer.advatar.systems/jwks.json | jq '.keys | length')" = 10
           test "$(jq -r '.credential_configurations_supported["dev.advatar.hybrid-pq.sd-jwt.v1"].format' <<<"$metadata")" = dev-hybrid-pq+cbor
           profile=$(curl --fail --silent --show-error https://issuer.advatar.systems/experimental/hybrid-pq/profile)
           test "$(jq -r '.credential_wrapper_schema' <<<"$profile")" = HybridCredentialWrapperV1
