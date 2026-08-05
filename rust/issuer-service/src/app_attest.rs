@@ -13,10 +13,14 @@
 //! End-to-end acceptance of a real device attestation is validated on-device (no attestation blob
 //! can be produced off a real iPhone); the deterministic sub-steps are unit-tested here.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use ciborium::value::Value as CborValue;
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode, Encode};
@@ -33,37 +37,92 @@ const AAGUID_DEV: &[u8; 16] = b"appattestdevelop";
 /// Trusted App Attest configuration, from the environment.
 #[derive(Clone)]
 pub struct AppAttestConfig {
-    /// `TEAMID.bundle-id`, e.g. `L2AF8KFX35.eu.advatar.wallet`.
-    app_id: String,
+    /// Accepted `TEAMID.bundle-id` app ids, e.g. `L2AF8KFX35.eu.advatar.wallet` (the wallet) and
+    /// `L2AF8KFX35.eu.advatar.wallet.pidcapture` (the capture companion). An attestation is accepted
+    /// when its `rpIdHash` matches SHA-256 of ANY of these.
+    app_ids: Vec<String>,
     /// Accept the development AAGUID (Xcode-attached builds). Off in production.
     allow_development: bool,
 }
 
 impl AppAttestConfig {
-    /// `APPLE_APP_ATTEST_APP_ID` (required); `APP_ATTEST_ALLOW_DEVELOPMENT` (optional). Absent app-id
-    /// ⇒ `None` and the App Attest endpoints are disabled (fail closed).
+    /// `APPLE_APP_ATTEST_APP_ID` (required — a comma-separated list of one or more `TEAMID.bundle-id`
+    /// app ids); `APP_ATTEST_ALLOW_DEVELOPMENT` (optional). No non-empty app id ⇒ `None` and the App
+    /// Attest endpoints are disabled (fail closed).
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let app_id = crate::env_file::var("APPLE_APP_ATTEST_APP_ID").filter(|v| !v.is_empty())?;
+        let raw = crate::env_file::var("APPLE_APP_ATTEST_APP_ID")?;
+        let app_ids: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if app_ids.is_empty() {
+            return None;
+        }
         let allow_development = crate::env_file::var("APP_ATTEST_ALLOW_DEVELOPMENT")
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         Some(Self {
-            app_id,
+            app_ids,
             allow_development,
         })
     }
 
-    fn rp_id_hash(&self) -> [u8; 32] {
-        Sha256::digest(self.app_id.as_bytes()).into()
+    /// The accepted app id whose SHA-256 equals `rp_id_hash`, if any. Attestations carry the app id
+    /// implicitly as `SHA256(app_id)` in `authData[0..32]`, so this identifies which app attested.
+    fn app_id_for_rp_id_hash(&self, rp_id_hash: &[u8]) -> Option<&str> {
+        self.app_ids
+            .iter()
+            .find(|id| Sha256::digest(id.as_bytes()).as_slice() == rp_id_hash)
+            .map(String::as_str)
     }
 }
 
-/// A registered app instance: its attested P-256 public key (SEC1 uncompressed point) and the
-/// monotonic assertion counter.
-#[derive(Clone)]
+/// A registered app instance: which app id it attested under, its attested P-256 public key (SEC1
+/// uncompressed point), and the monotonic assertion counter.
+///
+/// `Serialize`/`Deserialize` so the instance table can be persisted across restarts (see
+/// [`load_instances`] / [`save_instances`]): without persistence a restart drops every registration,
+/// which both re-opens the replay counter and locks out already-registered clients (Apple issues one
+/// attestation per key, so a client cannot silently re-register).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegisteredInstance {
+    /// The `TEAMID.bundle-id` this instance attested under (an assertion's `rpIdHash` must match it).
+    pub app_id: String,
     pub public_key: Vec<u8>,
     pub sign_count: u32,
+}
+
+/// Load the persisted `keyId → RegisteredInstance` table from `path`. A missing or unreadable file
+/// yields an empty table (fail-safe: unknown instances are rejected, never fail-open).
+#[must_use]
+pub fn load_instances(path: &Path) -> HashMap<String, RegisteredInstance> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        tracing::warn!(%error, "App Attest store is unreadable; starting with an empty table");
+        HashMap::new()
+    })
+}
+
+/// Atomically persist the `keyId → RegisteredInstance` table to `path` (write a temp file, then
+/// rename). Best-effort: serialization or I/O failures are logged, never fatal — the in-memory table
+/// remains authoritative for the running process.
+pub fn save_instances(path: &Path, instances: &HashMap<String, RegisteredInstance>) {
+    let Ok(json) = serde_json::to_vec(instances) else {
+        tracing::error!("cannot serialize the App Attest instance store");
+        return;
+    };
+    let tmp = path.with_extension("tmp");
+    if let Err(error) = std::fs::write(&tmp, &json) {
+        tracing::error!(%error, "cannot write the App Attest store temp file");
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        tracing::error!(%error, "cannot atomically replace the App Attest store");
+    }
 }
 
 /// Verify an App Attest attestation and return the attested P-256 public key (SEC1 point) on
@@ -75,7 +134,7 @@ pub fn verify_attestation(
     key_id: &[u8],
     config: &AppAttestConfig,
     now_unix: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<(String, Vec<u8>), String> {
     let root = Certificate::from_der(APPLE_ROOT_CA_DER)
         .map_err(|_| "embedded Apple App Attest root CA is malformed".to_string())?;
 
@@ -139,9 +198,10 @@ pub fn verify_attestation(
     if auth_data.len() < 55 {
         return Err("authData is too short".into());
     }
-    if auth_data[0..32] != config.rp_id_hash() {
-        return Err("authData rpIdHash does not match the configured app id".into());
-    }
+    let app_id = config
+        .app_id_for_rp_id_hash(&auth_data[0..32])
+        .ok_or("authData rpIdHash does not match any configured app id")?
+        .to_owned();
     let counter = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
     if counter != 0 {
         return Err("attestation counter must be zero".into());
@@ -162,16 +222,16 @@ pub fn verify_attestation(
         return Err("authData credentialId does not match keyId".into());
     }
 
-    Ok(cred_point.to_vec())
+    Ok((app_id, cred_point.to_vec()))
 }
 
-/// Verify an assertion over `client_data` (the request the app signed) against a registered
-/// instance, enforcing a strictly increasing counter. Returns the new counter to persist.
+/// Verify an assertion over `client_data` (the exact request bytes the app signed) against a
+/// registered instance, binding it to the app id the instance attested under and enforcing a
+/// strictly increasing counter. Returns the new counter to persist.
 pub fn verify_assertion(
     assertion_cbor: &[u8],
     client_data: &[u8],
     instance: &RegisteredInstance,
-    config: &AppAttestConfig,
 ) -> Result<u32, String> {
     let value: CborValue = ciborium::from_reader(assertion_cbor)
         .map_err(|_| "assertion is not valid CBOR".to_string())?;
@@ -185,8 +245,9 @@ pub fn verify_assertion(
     if authenticator_data.len() < 37 {
         return Err("assertion authenticatorData is too short".into());
     }
-    if authenticator_data[0..32] != config.rp_id_hash() {
-        return Err("assertion rpIdHash does not match the configured app id".into());
+    let expected_rp_id_hash: [u8; 32] = Sha256::digest(instance.app_id.as_bytes()).into();
+    if authenticator_data[0..32] != expected_rp_id_hash {
+        return Err("assertion rpIdHash does not match the instance's app id".into());
     }
     // nonce = SHA256(authenticatorData || SHA256(clientData)), verified with the instance key.
     let client_data_hash = Sha256::digest(client_data);
@@ -297,9 +358,14 @@ mod tests {
     use super::*;
     use p256::ecdsa::{SigningKey, signature::Signer};
 
+    const TEST_APP_ID: &str = "L2AF8KFX35.eu.advatar.wallet";
+
     fn cfg() -> AppAttestConfig {
         AppAttestConfig {
-            app_id: "L2AF8KFX35.eu.advatar.wallet".into(),
+            app_ids: vec![
+                TEST_APP_ID.into(),
+                "L2AF8KFX35.eu.advatar.wallet.pidcapture".into(),
+            ],
             allow_development: false,
         }
     }
@@ -320,9 +386,19 @@ mod tests {
     }
 
     #[test]
-    fn rp_id_hash_is_sha256_of_app_id() {
-        let expected: [u8; 32] = Sha256::digest(b"L2AF8KFX35.eu.advatar.wallet").into();
-        assert_eq!(cfg().rp_id_hash(), expected);
+    fn app_id_matches_by_rp_id_hash() {
+        let config = cfg();
+        let main_hash: [u8; 32] = Sha256::digest(TEST_APP_ID.as_bytes()).into();
+        assert_eq!(config.app_id_for_rp_id_hash(&main_hash), Some(TEST_APP_ID));
+        let companion_hash: [u8; 32] =
+            Sha256::digest(b"L2AF8KFX35.eu.advatar.wallet.pidcapture").into();
+        assert_eq!(
+            config.app_id_for_rp_id_hash(&companion_hash),
+            Some("L2AF8KFX35.eu.advatar.wallet.pidcapture")
+        );
+        // A hash of an app id that is NOT configured is rejected.
+        let other: [u8; 32] = Sha256::digest(b"L2AF8KFX35.com.evil.clone").into();
+        assert_eq!(config.app_id_for_rp_id_hash(&other), None);
     }
 
     #[test]
@@ -336,22 +412,19 @@ mod tests {
         assert_eq!(&der[6..38], &nonce);
     }
 
-    #[test]
-    fn assertion_counter_must_increase() {
-        // A registered instance with a real P-256 key; forge a matching assertion and check the
-        // counter monotonicity gate (the signature path is exercised with a real signature).
-        let sk = SigningKey::from_slice(&[9u8; 32]).expect("key");
+    /// Build a real assertion (P-256 signature over `SHA256(authData ‖ SHA256(client_data))`) with the
+    /// given counter, bound to `TEST_APP_ID`. Returns `(cbor_assertion, sec1_public_key)`.
+    fn make_assertion(sk: &SigningKey, counter: u32, client_data: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let point = sk
             .verifying_key()
             .to_encoded_point(false)
             .as_bytes()
             .to_vec();
-        let config = cfg();
         let mut auth = Vec::new();
-        auth.extend_from_slice(&config.rp_id_hash()); // rpIdHash
+        let rp_id_hash: [u8; 32] = Sha256::digest(TEST_APP_ID.as_bytes()).into();
+        auth.extend_from_slice(&rp_id_hash);
         auth.push(0); // flags
-        auth.extend_from_slice(&5u32.to_be_bytes()); // counter = 5
-        let client_data = b"POST /v1/credential body-hash";
+        auth.extend_from_slice(&counter.to_be_bytes());
         let client_data_hash = Sha256::digest(client_data);
         let mut hasher = Sha256::new();
         hasher.update(&auth);
@@ -364,26 +437,96 @@ mod tests {
             ),
             (
                 CborValue::Text("authenticatorData".into()),
-                CborValue::Bytes(auth.clone()),
+                CborValue::Bytes(auth),
             ),
         ]);
         let mut cbor = Vec::new();
         ciborium::into_writer(&assertion, &mut cbor).expect("encode");
+        (cbor, point)
+    }
+
+    #[test]
+    fn assertion_counter_must_increase() {
+        let sk = SigningKey::from_slice(&[9u8; 32]).expect("key");
+        let client_data = b"POST /v1/pid-capture/x/evidence body-hash";
+        let (cbor, point) = make_assertion(&sk, 5, client_data);
 
         // Stored counter 4 < 5 ⇒ accepted, returns 5.
         let instance = RegisteredInstance {
+            app_id: TEST_APP_ID.into(),
             public_key: point.clone(),
             sign_count: 4,
         };
-        assert_eq!(
-            verify_assertion(&cbor, client_data, &instance, &config).unwrap(),
-            5
-        );
+        assert_eq!(verify_assertion(&cbor, client_data, &instance).unwrap(), 5);
         // Stored counter 5 (not less than 5) ⇒ replay rejected.
         let replayed = RegisteredInstance {
+            app_id: TEST_APP_ID.into(),
             public_key: point,
             sign_count: 5,
         };
-        assert!(verify_assertion(&cbor, client_data, &replayed, &config).is_err());
+        assert!(verify_assertion(&cbor, client_data, &replayed).is_err());
+    }
+
+    #[test]
+    fn assertion_is_bound_to_the_exact_request_body() {
+        // An assertion generated over request body A must NOT verify against a different body B —
+        // this is the per-mutation binding property. Same key, same counter, different client_data.
+        let sk = SigningKey::from_slice(&[13u8; 32]).expect("key");
+        let body_a = br#"{"attestation":"AAA","client_ip":"203.0.113.1"}"#;
+        let body_b = br#"{"attestation":"BBB","client_ip":"203.0.113.1"}"#;
+        let (cbor, point) = make_assertion(&sk, 1, body_a);
+        let instance = RegisteredInstance {
+            app_id: TEST_APP_ID.into(),
+            public_key: point,
+            sign_count: 0,
+        };
+        // Bound body verifies…
+        assert_eq!(verify_assertion(&cbor, body_a, &instance).unwrap(), 1);
+        // …a tampered/different body does not (the signed nonce no longer matches).
+        assert!(verify_assertion(&cbor, body_b, &instance).is_err());
+    }
+
+    #[test]
+    fn instance_store_round_trips_and_preserves_the_counter() {
+        // Persisting then loading must return the same instances (app id + key + advanced counter),
+        // so a restart cannot reset sign_count (replay) or drop the registration (lock-out).
+        let mut instances = HashMap::new();
+        instances.insert(
+            "keyid-aaa".to_string(),
+            RegisteredInstance {
+                app_id: TEST_APP_ID.into(),
+                public_key: vec![4, 1, 2, 3, 4],
+                sign_count: 42,
+            },
+        );
+        let path = std::env::temp_dir().join("vcissuer-appattest-store-round-trip.json");
+        let _ = std::fs::remove_file(&path);
+        save_instances(&path, &instances);
+        let loaded = load_instances(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+        let entry = loaded.get("keyid-aaa").expect("entry present");
+        assert_eq!(entry.app_id, TEST_APP_ID);
+        assert_eq!(entry.public_key, vec![4, 1, 2, 3, 4]);
+        assert_eq!(entry.sign_count, 42);
+        // A missing store is empty, never an error (fail-safe, not fail-open).
+        let missing = std::env::temp_dir().join("vcissuer-appattest-store-does-not-exist.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_instances(&missing).is_empty());
+    }
+
+    #[test]
+    fn assertion_rp_id_hash_must_match_the_instance_app_id() {
+        // An assertion attested under TEST_APP_ID must not verify against an instance recorded under
+        // a different app id (prevents accepting one app's assertion as another's).
+        let sk = SigningKey::from_slice(&[21u8; 32]).expect("key");
+        let client_data = b"POST /v1/pid-capture/y/evidence";
+        let (cbor, point) = make_assertion(&sk, 3, client_data);
+        let wrong_app = RegisteredInstance {
+            app_id: "L2AF8KFX35.eu.advatar.wallet.pidcapture".into(),
+            public_key: point,
+            sign_count: 0,
+        };
+        assert!(verify_assertion(&cbor, client_data, &wrong_app).is_err());
     }
 }
