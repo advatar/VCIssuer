@@ -14,6 +14,10 @@
     <string>0.0.0.0:18080</string>
     <key>ISSUER_URL</key>
     <string>https://issuer.advatar.systems</string>
+    <!-- PID Capture universal-link host: serves the App Site Association and proxies the capture
+         API, so the invocation link opens the PIDCapture app for any wallet. -->
+    <key>PID_CAPTURE_INVOCATION_ORIGIN</key>
+    <string>https://pid.advatar.systems</string>
     <key>CORS_ORIGINS</key>
     <string>https://issuer.advatar.systems</string>
     <key>ENABLE_EXPERIMENTAL_HYBRID_PQ</key>
