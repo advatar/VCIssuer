@@ -152,6 +152,25 @@ impl HybridCredentialSigner {
         )
         .map_err(|_| HybridSignerError::Envelope)
     }
+
+    /// Produce a RAW ML-DSA-65 signature over arbitrary bytes with the wrapped PQ secret, applying
+    /// the exact key-generation/consistency guard `sign_envelope` performs. Unlike `sign_envelope`,
+    /// this does NOT wrap the bespoke `EUWALLET-EXPERIMENTAL-HYBRID-PQ` envelope: the hybrid-PQ mdoc
+    /// issuerAuth signs the COSE `Sig_structure` bytes directly (the same bytes ES256 signs), so the
+    /// resulting signature verifies with a standard FIPS-204 ML-DSA-65 verifier over those bytes.
+    pub fn sign_pq_raw(&self, message: &[u8]) -> Result<Vec<u8>, HybridSignerError> {
+        let stored = load_stored_key(&self.encrypted_key_path, &self.wrapping_key)?;
+        if stored.generation != self.generation
+            || stored.public_key != self.pq_public_key
+            || stored.classical_kid_hash
+                != Sha256::digest(self.classical.kid().as_bytes()).as_slice()
+        {
+            return Err(HybridSignerError::Storage(
+                "logical key generation changed during signing".into(),
+            ));
+        }
+        Ok(pq_backend::sign_once(&stored.secret_key, message)?)
+    }
 }
 
 struct StoredKey {

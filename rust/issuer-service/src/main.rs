@@ -1697,6 +1697,10 @@ async fn submit_pid_capture_evidence(
             &holder_jwk,
             now,
             Some(&verified.claims),
+            // Experimental hybrid-PQ: when ENABLE_EXPERIMENTAL_HYBRID_PQ is on, the signer is present
+            // and the captured PID mdoc's issuerAuth also carries an ML-DSA-65 signature (additive;
+            // ES256-only verifiers are unaffected). None (classical only) when the flag is off.
+            state.hybrid_credential_signer.as_deref(),
         )?;
         let session = inner
             .capture_sessions
@@ -2460,6 +2464,7 @@ async fn credential(
                     &request.credential_configuration_id,
                     &verified_proof.holder_jwk,
                     now,
+                    None,
                     None,
                 )?;
                 Ok(Json(json!({"credentials": [{"credential": credential}]})))
@@ -3840,6 +3845,15 @@ fn decode_portrait_bytes(portrait: Option<&str>) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Private-use COSE unprotected-header label carrying the experimental hybrid-PQ ML-DSA-65 signature
+/// over the mdoc's COSE `Sig_structure` (the same bytes the ES256 `issuerAuth` signature covers).
+const HYBRID_PQ_MDOC_SIGNATURE_LABEL: i64 = -65537;
+/// Private-use COSE unprotected-header label carrying the ML-DSA-65 public key (FIPS-204, 1952 bytes)
+/// so a hybrid-aware verifier can check the PQ signature. Both labels are in the COSE private-use
+/// range and avoid the parsed labels (1=alg, 2=crit, 4=kid, 33=x5chain), so ES256-only verifiers
+/// ignore them.
+const HYBRID_PQ_MDOC_PUBLIC_KEY_LABEL: i64 = -65538;
+
 #[allow(clippy::too_many_lines)]
 fn issue_mdoc(
     signer: &KeychainSigner,
@@ -3847,6 +3861,7 @@ fn issue_mdoc(
     holder_jwk: &Value,
     now: u64,
     pid_claims: Option<&PidSubjectClaims>,
+    hybrid: Option<&HybridCredentialSigner>,
 ) -> Result<String, (StatusCode, Json<OAuthError>)> {
     let (doc_type, namespace, claims): (&str, &str, Vec<(&str, CborValue)>) = match profile {
         PID_FROM_EMRTD_MDOC => {
@@ -3990,16 +4005,15 @@ fn issue_mdoc(
         CborValue::Bytes(Vec::new()),
         CborValue::Bytes(mso_payload.clone()),
     ]);
-    let signature = signer
-        .sign_es256(&cbor_encode(&sig_structure)?)
-        .map_err(|error| {
-            tracing::error!(%error, "mdoc signing failed");
-            oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "mdoc signing is unavailable",
-            )
-        })?;
+    let tbs = cbor_encode(&sig_structure)?;
+    let signature = signer.sign_es256(&tbs).map_err(|error| {
+        tracing::error!(%error, "mdoc signing failed");
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "mdoc signing is unavailable",
+        )
+    })?;
     let certificate_label = format!("dev.advatar.vcissuer.{}", key_label(profile));
     let certificate =
         KeychainSigner::development_certificate_der(&certificate_label).map_err(|error| {
@@ -4010,14 +4024,39 @@ fn issue_mdoc(
                 "mdoc issuer certificate is unavailable",
             )
         })?;
+    // COSE unprotected header: x5chain (label 33). When a hybrid-PQ signer is supplied (the caller
+    // gates this on ENABLE_EXPERIMENTAL_HYBRID_PQ), ALSO carry an ML-DSA-65 signature over the SAME
+    // COSE Sig_structure bytes the ES256 signature covers, plus the ML-DSA-65 public key, under
+    // private-use labels. Standard COSE parsers ignore unknown, non-critical unprotected labels, so
+    // an ES256-only verifier (including the wallet) still verifies the mdoc unchanged; a hybrid-aware
+    // verifier additionally checks ML-DSA-65 over the same bytes.
+    let mut unprotected = vec![(
+        cbor_int(33),
+        CborValue::Array(vec![CborValue::Bytes(certificate)]),
+    )];
+    if let Some(hybrid) = hybrid {
+        let pq_signature = hybrid.sign_pq_raw(&tbs).map_err(|error| {
+            tracing::error!(%error, "hybrid-PQ mdoc signing failed");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "hybrid-PQ mdoc signing is unavailable",
+            )
+        })?;
+        unprotected.push((
+            cbor_int(HYBRID_PQ_MDOC_SIGNATURE_LABEL),
+            CborValue::Bytes(pq_signature),
+        ));
+        unprotected.push((
+            cbor_int(HYBRID_PQ_MDOC_PUBLIC_KEY_LABEL),
+            CborValue::Bytes(hybrid.pq_public_key().to_vec()),
+        ));
+    }
     let issuer_auth = CborValue::Tag(
         18,
         Box::new(CborValue::Array(vec![
             CborValue::Bytes(protected),
-            CborValue::Map(vec![(
-                cbor_int(33),
-                CborValue::Array(vec![CborValue::Bytes(certificate)]),
-            )]),
+            CborValue::Map(unprotected),
             CborValue::Bytes(mso_payload),
             CborValue::Bytes(signature.to_vec()),
         ])),
@@ -5106,6 +5145,7 @@ mod tests {
             &holder_jwk,
             unix_time().expect("clock"),
             None,
+            None,
         )
         .expect("mdoc issuance");
         let bytes = URL_SAFE_NO_PAD.decode(credential).expect("base64url mdoc");
@@ -5167,5 +5207,77 @@ mod tests {
                 &Signature::from_slice(signature).expect("raw ES256 signature"),
             )
             .expect("COSE signature verifies");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and accesses persistent macOS Keychain + hybrid PQ key material"]
+    fn hybrid_pq_mdoc_issuer_auth_carries_verifiable_ml_dsa_signature() {
+        let signer =
+            KeychainSigner::find_or_create("dev.advatar.vcissuer.test-mdoc").expect("test signer");
+        KeychainSigner::development_certificate_der("dev.advatar.vcissuer.pid-mdoc")
+            .expect("development certificate");
+        let hybrid =
+            HybridCredentialSigner::find_or_create("dev.advatar.vcissuer.hybrid-pq.es256.v1")
+                .expect("hybrid signer");
+        let holder = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let point = holder.verifying_key().to_encoded_point(false);
+        let holder_jwk = json!({
+            "kty":"EC","crv":"P-256",
+            "x":URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
+            "y":URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"))
+        });
+        // Any mdoc profile exercises the profile-independent hybrid injection; `Some(&hybrid)` turns
+        // on the ML-DSA-65 issuerAuth signature.
+        let credential = issue_mdoc(
+            &signer,
+            PID_MDOC,
+            &holder_jwk,
+            unix_time().expect("clock"),
+            None,
+            Some(&hybrid),
+        )
+        .expect("hybrid-PQ mdoc issuance");
+        let bytes = URL_SAFE_NO_PAD.decode(credential).expect("base64url mdoc");
+        let decoded: CborValue = ciborium::de::from_reader(bytes.as_slice()).expect("CBOR mdoc");
+        let CborValue::Map(entries) = decoded else {
+            panic!("IssuerSigned must be a CBOR map");
+        };
+        let issuer_auth = entries
+            .iter()
+            .find_map(|(key, value)| (key.as_text() == Some("issuerAuth")).then_some(value))
+            .expect("issuerAuth");
+        let CborValue::Tag(18, cose) = issuer_auth else {
+            panic!("issuerAuth must be tagged COSE_Sign1");
+        };
+        let CborValue::Array(cose) = cose.as_ref() else {
+            panic!("COSE_Sign1 must be an array");
+        };
+        let protected = cose[0].as_bytes().expect("protected headers");
+        let unprotected = cose[1].as_map().expect("unprotected headers");
+        let payload = cose[2].as_bytes().expect("MSO payload");
+        // The COSE Sig_structure both the ES256 and the ML-DSA-65 signatures cover.
+        let sig_structure = CborValue::Array(vec![
+            CborValue::Text("Signature1".into()),
+            CborValue::Bytes(protected.clone()),
+            CborValue::Bytes(Vec::new()),
+            CborValue::Bytes(payload.clone()),
+        ]);
+        let tbs = cbor_encode(&sig_structure).expect("Sig_structure");
+        let unprotected_bytes = |wanted: i64| -> Vec<u8> {
+            unprotected
+                .iter()
+                .find_map(|(label, value)| {
+                    (label.as_integer().and_then(|v| i64::try_from(v).ok()) == Some(wanted))
+                        .then(|| value.as_bytes().expect("bytes").clone())
+                })
+                .unwrap_or_else(|| panic!("unprotected label {wanted} present"))
+        };
+        let pq_signature = unprotected_bytes(HYBRID_PQ_MDOC_SIGNATURE_LABEL);
+        let pq_public_key = unprotected_bytes(HYBRID_PQ_MDOC_PUBLIC_KEY_LABEL);
+        assert_eq!(pq_public_key, hybrid.pq_public_key());
+        // The ML-DSA-65 signature verifies over the SAME bytes the ES256 issuerAuth signature does.
+        pq_backend::verify_signature(&pq_public_key, &tbs, &pq_signature)
+            .expect("ML-DSA-65 issuerAuth signature verifies");
     }
 }
