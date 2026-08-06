@@ -81,6 +81,22 @@ const PID_VCT: &str = "eu.europa.ec.eudi.pid.1";
 /// `vct` is a real PID (`eu.europa.ec.eudi.pid.1`); the configuration id is distinct so the NFC
 /// proofing path has its own scope, signer, and metadata entry.
 const PID_FROM_EMRTD_SD_JWT: &str = "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc";
+/// NFC-sourced PID (ISO 18013-5 mdoc). The SAME chip + liveness proofing as
+/// [`PID_FROM_EMRTD_SD_JWT`], emitted as the ARF-required `mso_mdoc` half (doctype
+/// `eu.europa.ec.eudi.pid.1`) so the captured PID is presentable in person and over the Digital
+/// Credentials API. It carries `require_chip_liveness` exactly like its SD-JWT sibling, so the
+/// Lean-proved (format-parametric) downgrade-closed gate refuses to mint it without verified Passive
+/// Authentication, anti-cloning, and portrait-matched liveness. Capture-only: it is deliberately NOT
+/// in [`valid_scope`], so it can be minted solely through the proven capture-evidence path, never a
+/// bare `/credential` request. Reusing the demo [`PID_MDOC`] here would bypass the chip-liveness
+/// gate (a downgrade) — hence a distinct, gated configuration id.
+const PID_FROM_EMRTD_MDOC: &str = "eu.europa.ec.eudi.pid_mso_mdoc.de:nfc";
+
+/// Both NFC-sourced PID configurations (SD-JWT + mdoc) share the chip+liveness kernel gate. Keeping
+/// the membership test in one place stops a new format from silently skipping a gate conjunct.
+fn is_nfc_pid(profile: &str) -> bool {
+    profile == PID_FROM_EMRTD_SD_JWT || profile == PID_FROM_EMRTD_MDOC
+}
 /// The liveness assurance marker a trusted reader/liveness attestation must carry (mirrors the
 /// Svipe `face_present:iproov:gpa` requirement): a genuine-presence `iProov` capture.
 const EMRTD_REQUIRED_LIVENESS: &str = "iproov:gpa";
@@ -522,6 +538,7 @@ async fn main() {
     let credential_signers = [
         PID_SD_JWT,
         PID_FROM_EMRTD_SD_JWT,
+        PID_FROM_EMRTD_MDOC,
         PID_MDOC,
         EAA_MDOC,
         QEAA_SD_JWT,
@@ -764,6 +781,7 @@ fn issuer_metadata_value(state: &AppState) -> Value {
         "credential_configurations_supported": {
             PID_SD_JWT: sd_jwt_profile(PID_SD_JWT, "eu.europa.ec.eudi.pid.1", "German PID (SD-JWT VC)"),
             PID_FROM_EMRTD_SD_JWT: pid_from_emrtd_profile(),
+            PID_FROM_EMRTD_MDOC: pid_from_emrtd_mdoc_profile(),
             PID_MDOC: mdoc_profile(PID_MDOC, "eu.europa.ec.eudi.pid.1", "German PID (mdoc)"),
             EAA_MDOC: mdoc_profile(EAA_MDOC, "org.iso.18013.5.1.mDL", "German driving licence EAA (mdoc)"),
             QEAA_SD_JWT: learning_profile(QEAA_SD_JWT, "German learning QEAA (independently identified)", false),
@@ -908,6 +926,34 @@ fn pid_from_emrtd_profile() -> Value {
         PID_FROM_EMRTD_SD_JWT,
         PID_VCT,
         "German PID (NFC chip + liveness proofed)",
+    );
+    let object = value.as_object_mut().expect("profile is an object");
+    object.insert(
+        "identity_assurance".into(),
+        json!({
+            "source": "emrtd_chip_read",
+            "chip_authentication": true,
+            "passive_authentication": true,
+            "holder_liveness": EMRTD_REQUIRED_LIVENESS,
+            "evidence_binding": "trusted_reader_attestation_jws"
+        }),
+    );
+    object.insert("development_only".into(), json!(true));
+    object.insert("eudi_conformant".into(), json!(false));
+    value
+}
+
+/// NFC-sourced PID credential configuration, ISO 18013-5 `mso_mdoc` half (doctype
+/// `eu.europa.ec.eudi.pid.1`). Same chip + liveness proofing and the same Lean-proved
+/// `require_chip_liveness` gate as [`pid_from_emrtd_profile`]; emitted so the captured PID is
+/// presentable in person and over the Digital Credentials API. Development-only until Passive
+/// Authentication runs against a provisioned CSCA master list and a real IACA/DS trust chain
+/// replaces the development document signer.
+fn pid_from_emrtd_mdoc_profile() -> Value {
+    let mut value = mdoc_profile(
+        PID_FROM_EMRTD_MDOC,
+        PID_VCT,
+        "German PID (NFC chip + liveness proofed, mdoc)",
     );
     let object = value.as_object_mut().expect("profile is an object");
     object.insert(
@@ -1390,6 +1436,7 @@ async fn create_pid_capture_session(
             iproov_token: iproov_token.clone(),
             status: capture::CaptureStatus::AwaitingEvidence,
             credential: None,
+            credential_mdoc: None,
             expires_at,
             device_token: request.device_token,
         },
@@ -1449,14 +1496,21 @@ async fn get_pid_capture_session(
         }
     }
     if let Some(credential) = &session.credential {
-        let (offer, deep_link) = capture::credential_offer(
-            state.issuer.as_str().trim_end_matches('/'),
-            PID_FROM_EMRTD_SD_JWT,
-            credential,
-        );
+        // Carry BOTH ARF formats when the mdoc half is present (it always is for a freshly captured
+        // PID; the field is optional only so an in-flight session decodes).
+        let mut entries = vec![(PID_FROM_EMRTD_SD_JWT, "dc+sd-jwt", credential.as_str())];
+        if let Some(mdoc) = &session.credential_mdoc {
+            entries.push((PID_FROM_EMRTD_MDOC, "mso_mdoc", mdoc.as_str()));
+        }
+        let (offer, deep_link) =
+            capture::credential_offer(state.issuer.as_str().trim_end_matches('/'), &entries);
         let object = body.as_object_mut().expect("body is an object");
         object.insert("format".into(), json!("dc+sd-jwt"));
         object.insert("credential".into(), json!(credential));
+        if let Some(mdoc) = &session.credential_mdoc {
+            object.insert("format_mdoc".into(), json!("mso_mdoc"));
+            object.insert("credential_mdoc".into(), json!(mdoc));
+        }
         object.insert("credential_offer".into(), offer);
         // `openid-credential-offer://` deep link: same-device hand-off, or direct wallet ingest.
         object.insert("deep_link".into(), json!(deep_link));
@@ -1615,12 +1669,42 @@ async fn submit_pid_capture_evidence(
             None,
             Some(&verified.claims),
         )?;
+        // ARF dual-format: mint the SAME captured PID ALSO as an ISO 18013-5 `mso_mdoc`, through its
+        // own chip-liveness-gated profile. The kernel gate is re-evaluated for the mdoc profile
+        // against the same verified chip + liveness evidence — same downgrade-closed guarantee, just
+        // the `Mdoc` format — so the captured PID becomes presentable in person and over the Digital
+        // Credentials API without weakening the proofing.
+        if let Err(error) = authorize_kernel(
+            PID_FROM_EMRTD_MDOC,
+            &holder_jkt,
+            &nonce,
+            None,
+            Some(&verified),
+            now,
+        ) {
+            if let Some(session) = inner.capture_sessions.get_mut(&id) {
+                session.status = capture::CaptureStatus::Failed;
+            }
+            return Err(error);
+        }
+        let mdoc_signer = state
+            .credential_signers
+            .get(PID_FROM_EMRTD_MDOC)
+            .expect("closed profile has a signer");
+        let credential_mdoc = issue_mdoc(
+            mdoc_signer,
+            PID_FROM_EMRTD_MDOC,
+            &holder_jwk,
+            now,
+            Some(&verified.claims),
+        )?;
         let session = inner
             .capture_sessions
             .get_mut(&id)
             .expect("session existed above");
         session.status = capture::CaptureStatus::Issued;
         session.credential = Some(credential.clone());
+        session.credential_mdoc = Some(credential_mdoc.clone());
         session.iproov_token = None; // single-use
         let notify_token = session.device_token.clone();
         drop(inner);
@@ -1642,13 +1726,19 @@ async fn submit_pid_capture_evidence(
         }
         let (offer, deep_link) = capture::credential_offer(
             state.issuer.as_str().trim_end_matches('/'),
-            PID_FROM_EMRTD_SD_JWT,
-            &credential,
+            &[
+                (PID_FROM_EMRTD_SD_JWT, "dc+sd-jwt", credential.as_str()),
+                (PID_FROM_EMRTD_MDOC, "mso_mdoc", credential_mdoc.as_str()),
+            ],
         );
         Ok(Json(json!({
             "status": "issued",
+            // The SD-JWT half stays under `format`/`credential` for backward compatibility; the mdoc
+            // half is a sibling pair. Both are also listed in `credential_offer.credentials`.
             "format": "dc+sd-jwt",
             "credential": credential,
+            "format_mdoc": "mso_mdoc",
+            "credential_mdoc": credential_mdoc,
             "credential_offer": offer,
             // `openid-credential-offer://` deep link so the companion can hand the PID to a wallet on
             // the same device; the target wallet also receives it via the poll response above.
@@ -2370,6 +2460,7 @@ async fn credential(
                     &request.credential_configuration_id,
                     &verified_proof.holder_jwk,
                     now,
+                    None,
                 )?;
                 Ok(Json(json!({"credentials": [{"credential": credential}]})))
             }
@@ -2447,6 +2538,7 @@ fn key_label(profile: &str) -> &'static str {
     match profile {
         PID_SD_JWT => "pid-sd-jwt",
         PID_FROM_EMRTD_SD_JWT => "pid-from-emrtd-sd-jwt",
+        PID_FROM_EMRTD_MDOC => "pid-from-emrtd-mdoc",
         PID_MDOC => "pid-mdoc",
         EAA_MDOC => "eaa-mdoc",
         QEAA_SD_JWT => "qeaa-sd-jwt",
@@ -3269,7 +3361,7 @@ fn authorize_kernel(
     now: u64,
 ) -> Result<Option<MandateGrant>, (StatusCode, Json<OAuthError>)> {
     let role = match profile_name {
-        PID_SD_JWT | PID_FROM_EMRTD_SD_JWT | PID_MDOC => IssuerRole::Pid,
+        PID_SD_JWT | PID_FROM_EMRTD_SD_JWT | PID_FROM_EMRTD_MDOC | PID_MDOC => IssuerRole::Pid,
         QEAA_SD_JWT | QEAA_PID_BOUND_SD_JWT | DEV_SVIPE_PID_SD_JWT => IssuerRole::Qeaa,
         EAA_MDOC => IssuerRole::NonQualifiedEaa,
         TLSN_EVIDENCE_SD_JWT | HYBRID_PQ_SD_JWT => IssuerRole::DevelopmentEvidence,
@@ -3291,7 +3383,7 @@ fn authorize_kernel(
         | TLSN_EVIDENCE_SD_JWT
         | HYBRID_PQ_SD_JWT
         | MANDATE_SD_JWT => CredentialFormat::SdJwtVc,
-        PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
+        PID_FROM_EMRTD_MDOC | PID_MDOC | EAA_MDOC => CredentialFormat::Mdoc,
         _ => unreachable!("profile was checked above"),
     };
     let profile_id = ProfileId(hash_u128(profile_name));
@@ -3306,7 +3398,7 @@ fn authorize_kernel(
             "PID-bound issuance has no verified PID subject",
         ));
     }
-    if profile_name == PID_FROM_EMRTD_SD_JWT && chip_liveness.is_none() {
+    if is_nfc_pid(profile_name) && chip_liveness.is_none() {
         return Err(oauth_error(
             StatusCode::FORBIDDEN,
             "credential_request_denied",
@@ -3348,7 +3440,7 @@ fn authorize_kernel(
         require_hybrid_pq: false,
         // The NFC-sourced PID profile is the one that opts into the (Lean-proved) chip+liveness
         // gate; every other profile proofs the subject a different way and leaves it un-required.
-        require_chip_liveness: profile_name == PID_FROM_EMRTD_SD_JWT,
+        require_chip_liveness: is_nfc_pid(profile_name),
     };
     let proof = CredentialProof {
         evidence,
@@ -3392,7 +3484,7 @@ fn authorize_kernel(
             // For the NFC-sourced PID, LoA-high is EARNED from the verified chip + liveness evidence
             // (Passive Auth + anti-cloning + portrait-matched liveness), not asserted; other
             // development profiles keep the demo assertion.
-            loa_high: if profile_name == PID_FROM_EMRTD_SD_JWT {
+            loa_high: if is_nfc_pid(profile_name) {
                 chip_liveness
                     .is_some_and(|c| c.sod_passive_auth && c.chip_authentic && c.liveness_matched)
             } else {
@@ -3733,13 +3825,52 @@ fn issue_mandate_sd_jwt(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_lines)]
+/// Best-effort decode of a base64 eMRTD (DG2) portrait into raw JPEG bytes for the mdoc `portrait`
+/// element. Empty on absence or malformed input — the wallet accepts an empty `portrait` as the
+/// not-yet-captured case, so a bad decode degrades gracefully rather than failing issuance.
+fn decode_portrait_bytes(portrait: Option<&str>) -> Vec<u8> {
+    let Some(raw) = portrait else {
+        return Vec::new();
+    };
+    // Tolerate a `data:*;base64,` URL prefix.
+    let b64 = raw.rsplit_once(',').map_or(raw, |(_, tail)| tail).trim();
+    STANDARD
+        .decode(b64)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(b64))
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_lines)]
 fn issue_mdoc(
     signer: &KeychainSigner,
     profile: &str,
     holder_jwk: &Value,
     now: u64,
+    pid_claims: Option<&PidSubjectClaims>,
 ) -> Result<String, (StatusCode, Json<OAuthError>)> {
     let (doc_type, namespace, claims): (&str, &str, Vec<(&str, CborValue)>) = match profile {
+        PID_FROM_EMRTD_MDOC => {
+            // Real DG1 (MRZ) identity from the verified chip read — not the demo constants. Mirrors
+            // the SD-JWT NFC arm; `portrait` is a MANDATORY PID element (empty bytes = the
+            // not-yet-captured case), so it is always present.
+            let pid = pid_claims.expect("NFC-sourced PID mdoc checked chip + liveness evidence");
+            let claims = vec![
+                ("family_name", CborValue::Text(pid.family_name.clone())),
+                ("given_name", CborValue::Text(pid.given_name.clone())),
+                ("birth_date", CborValue::Text(pid.birthdate.clone())),
+                ("age_over_18", CborValue::Bool(pid.age_over_18)),
+                ("nationality", CborValue::Text(pid.nationality.clone())),
+                (
+                    "issuing_country",
+                    CborValue::Text(pid.issuing_country.clone()),
+                ),
+                (
+                    "portrait",
+                    CborValue::Bytes(decode_portrait_bytes(pid.portrait.as_deref())),
+                ),
+            ];
+            ("eu.europa.ec.eudi.pid.1", "eu.europa.ec.eudi.pid.1", claims)
+        }
         PID_MDOC => (
             "eu.europa.ec.eudi.pid.1",
             "eu.europa.ec.eudi.pid.1",
@@ -4874,6 +5005,16 @@ mod tests {
 
         // No chip evidence at all → the NFC-sourced PID profile fails closed.
         assert!(authorize_kernel(PID_FROM_EMRTD_SD_JWT, holder, nonce, None, None, now).is_err());
+
+        // The NFC-sourced PID *mdoc* profile is gated IDENTICALLY — the same downgrade-closed
+        // chip+liveness kernel gate, only the `Mdoc` format differs. Verified evidence issues;
+        // failed Passive Authentication and missing evidence both fail closed. This is the whole
+        // safety argument for minting the captured PID as mdoc: it never weakens the proofing.
+        assert!(authorize_kernel(PID_FROM_EMRTD_MDOC, holder, nonce, None, Some(&ok), now).is_ok());
+        assert!(
+            authorize_kernel(PID_FROM_EMRTD_MDOC, holder, nonce, None, Some(&denied), now).is_err()
+        );
+        assert!(authorize_kernel(PID_FROM_EMRTD_MDOC, holder, nonce, None, None, now).is_err());
     }
 
     #[test]
@@ -4959,8 +5100,14 @@ mod tests {
             "x":URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
             "y":URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"))
         });
-        let credential = issue_mdoc(&signer, PID_MDOC, &holder_jwk, unix_time().expect("clock"))
-            .expect("mdoc issuance");
+        let credential = issue_mdoc(
+            &signer,
+            PID_MDOC,
+            &holder_jwk,
+            unix_time().expect("clock"),
+            None,
+        )
+        .expect("mdoc issuance");
         let bytes = URL_SAFE_NO_PAD.decode(credential).expect("base64url mdoc");
         let decoded: CborValue = ciborium::de::from_reader(bytes.as_slice()).expect("CBOR mdoc");
         let CborValue::Map(entries) = decoded else {

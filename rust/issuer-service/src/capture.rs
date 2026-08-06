@@ -46,6 +46,10 @@ pub struct CaptureSession {
     pub status: CaptureStatus,
     /// The issued PID SD-JWT, once `status == Issued`.
     pub credential: Option<String>,
+    /// The issued PID mdoc (`mso_mdoc`, doctype `eu.europa.ec.eudi.pid.1`), once `status == Issued`.
+    /// The ARF-required second format of the same captured PID, minted alongside the SD-JWT so the
+    /// captured PID is presentable in person (ISO 18013-5) and over the Digital Credentials API.
+    pub credential_mdoc: Option<String>,
     pub expires_at: u64,
     /// Optional APNs device token to notify when the PID is issued.
     pub device_token: Option<String>,
@@ -132,12 +136,24 @@ pub fn invocation_origin(configured: Option<String>, issuer_origin: &str) -> Str
 ///
 /// The offer is carried by value (no `credential_offer_uri` round-trip) so it works offline and
 /// cross-app without an extra fetch. `issuer_origin` must have no trailing slash.
+///
+/// `credentials` is one or more `(configuration_id, format, credential)` entries — the ARF
+/// dual-format PID lists both the `dc+sd-jwt` and the `mso_mdoc` halves so a wallet ingests both
+/// from a single offer.
 #[must_use]
-pub fn credential_offer(issuer_origin: &str, config_id: &str, credential: &str) -> (Value, String) {
+pub fn credential_offer(
+    issuer_origin: &str,
+    credentials: &[(&str, &str, &str)],
+) -> (Value, String) {
+    let configuration_ids: Vec<&str> = credentials.iter().map(|(id, _, _)| *id).collect();
+    let credential_entries: Vec<Value> = credentials
+        .iter()
+        .map(|(_, format, credential)| json!({ "format": format, "credential": credential }))
+        .collect();
     let offer = json!({
         "credential_issuer": issuer_origin,
-        "credential_configuration_ids": [config_id],
-        "credentials": [{ "format": "dc+sd-jwt", "credential": credential }],
+        "credential_configuration_ids": configuration_ids,
+        "credentials": credential_entries,
     });
     let mut link = Url::parse("openid-credential-offer://").expect("static scheme is valid");
     link.query_pairs_mut().append_pair(
@@ -228,8 +244,11 @@ mod tests {
     fn credential_offer_yields_object_and_by_value_deep_link() {
         let (offer, link) = credential_offer(
             "https://issuer.advatar.systems",
-            "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc",
-            "eyJ.sd-jwt.credential~",
+            &[(
+                "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc",
+                "dc+sd-jwt",
+                "eyJ.sd-jwt.credential~",
+            )],
         );
         assert_eq!(offer["credential_issuer"], "https://issuer.advatar.systems");
         assert_eq!(
@@ -246,6 +265,36 @@ mod tests {
             .map(|(_, v)| v.into_owned())
             .expect("credential_offer query present");
         assert_eq!(serde_json::from_str::<Value>(&carried).unwrap(), offer);
+    }
+
+    #[test]
+    fn credential_offer_carries_both_arf_formats() {
+        let (offer, _link) = credential_offer(
+            "https://issuer.advatar.systems",
+            &[
+                (
+                    "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc",
+                    "dc+sd-jwt",
+                    "eyJ.sd-jwt~",
+                ),
+                (
+                    "eu.europa.ec.eudi.pid_mso_mdoc.de:nfc",
+                    "mso_mdoc",
+                    "b64url-mdoc",
+                ),
+            ],
+        );
+        // Both configuration ids and both credential entries are listed, in order.
+        assert_eq!(
+            offer["credential_configuration_ids"],
+            json!([
+                "eu.europa.ec.eudi.pid_vc_sd_jwt.de:nfc",
+                "eu.europa.ec.eudi.pid_mso_mdoc.de:nfc"
+            ])
+        );
+        assert_eq!(offer["credentials"][0]["format"], "dc+sd-jwt");
+        assert_eq!(offer["credentials"][1]["format"], "mso_mdoc");
+        assert_eq!(offer["credentials"][1]["credential"], "b64url-mdoc");
     }
 
     #[test]
