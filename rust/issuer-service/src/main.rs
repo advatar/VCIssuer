@@ -4412,6 +4412,93 @@ mod tests {
         );
     }
 
+    /// Mint a GOLDEN mandate SD-JWT for the EU-Wallet wallet-agent to exercise, using the issuer's
+    /// REAL pure encoder (`mandate_sd_jwt_payload`) so the wire structure stays byte-faithful to what
+    /// `/credential` emits, but signed with a FIXED in-test P-256 key so the artefact is hermetic and
+    /// cross-platform (no macOS Keychain). The signature is nonetheless a real ES256 signature that
+    /// the wallet verifies against the emitted public JWK — "real minted" means load-bearing.
+    ///
+    /// Run `cargo test -p issuer-service mint_mandate_golden_for_wallet_agent -- --nocapture` and
+    /// vendor the two emitted blocks into `EUWallet/crates/testagent/testdata/`.
+    #[test]
+    fn mint_mandate_golden_for_wallet_agent() {
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer, signature::Verifier as _};
+
+        // Fixed issuer signing key → deterministic public key (the salts inside the encoder are still
+        // random, so the compact string varies per run; capture one instance to vendor).
+        let signing_key = SigningKey::from_slice(&[42u8; 32]).expect("valid p256 scalar");
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(point.x().expect("x coord"));
+        let y = URL_SAFE_NO_PAD.encode(point.y().expect("y coord"));
+        let issuer_jwk = json!({"kty": "EC", "crv": "P-256", "x": x, "y": y});
+        let kid = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            serde_json::to_vec(&json!({"crv": "P-256", "kty": "EC", "x": x, "y": y})).unwrap(),
+        ));
+
+        // The delegate (agent) cnf key — a REAL fixed P-256 key (not a placeholder), so the wallet's
+        // holder-binding check compares real key material. The wallet vendors the emitted AGENT_JWK
+        // and presents the same coordinates; a mandate bound to a different agent key is rejected.
+        let agent_key = SigningKey::from_slice(&[7u8; 32]).expect("valid agent p256 scalar");
+        let agent_point = agent_key.verifying_key().to_encoded_point(false);
+        let agent_jwk = json!({
+            "kty": "EC", "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(agent_point.x().expect("agent x coord")),
+            "y": URL_SAFE_NO_PAD.encode(agent_point.y().expect("agent y coord")),
+        });
+        let issuer = Url::parse("https://issuer.advatar.systems/").expect("valid issuer url");
+        let now = 1_700_000_000u64;
+        // Grant every power EXCEPT administer-account (bit 5), so the wallet demo shows in-scope
+        // present/pay/records AND a real out-of-scope refusal for administer-account.
+        let powers = Powers(0b01_1111);
+        let (payload, disclosures) = mandate_sd_jwt_payload(
+            &issuer,
+            &agent_jwk,
+            "urn:eudi:subject:erika-mustermann",
+            powers,
+            "mandamus:cap:7f3a",
+            now,
+        );
+
+        let header = json!({"alg": "ES256", "typ": "dc+sd-jwt", "kid": kid});
+        let protected = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let input = format!("{protected}.{payload_b64}");
+        let signature: Signature = signing_key.sign(input.as_bytes());
+        let compact = format!(
+            "{input}.{}~{}~",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            disclosures.join("~")
+        );
+
+        // Self-check: this is a REAL ES256 signature over the issuer-signed input, and the payload is
+        // a real mandate. (The wallet re-verifies the same way against the emitted public key.)
+        verifying_key
+            .verify(input.as_bytes(), &signature)
+            .expect("golden must verify against its own public key");
+        assert_eq!(payload["vct"], json!(issuer_core::MANDATE_VCT));
+        assert_eq!(
+            issuer_core::powers_to_scope_urns(powers).len(),
+            5,
+            "golden grants five of six powers (administer-account withheld)"
+        );
+
+        eprintln!("---MANDATE_SDJWT---\n{compact}\n---END---");
+        eprintln!(
+            "---ISSUER_JWK---\n{}\n---END---",
+            serde_json::to_string(&issuer_jwk).unwrap()
+        );
+        eprintln!(
+            "---AGENT_JWK---\n{}\n---END---",
+            serde_json::to_string(&agent_jwk).unwrap()
+        );
+        // The wallet must verify with a clock inside [nbf, exp): iat=nbf=now, exp=now+900.
+        eprintln!(
+            "---VALIDITY---\nnbf={now} exp={} (mandate lifetime {MANDATE_LIFETIME_SECONDS}s)\n---END---",
+            now + MANDATE_LIFETIME_SECONDS
+        );
+    }
+
     #[test]
     fn scope_is_closed() {
         assert!(valid_scope(PID_SD_JWT, false));
